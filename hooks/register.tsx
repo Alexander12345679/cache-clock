@@ -112,6 +112,11 @@ type Flags = {
   isBackfilled: boolean
   /** What the last main request sent ahead of the conversation; null until one ran. */
   prompt: PromptPrint | null
+  /** When the last main turn began, and when Stop last ran for one; 0 until then. */
+  turnAt: number
+  stoppedAt: number
+  /** The transcript's modification time when last looked at; 0 until then. */
+  watched: number
 }
 
 // What a main request sends ahead of the conversation, where a change
@@ -810,6 +815,44 @@ function requestStart(lines: string[], i: number, id: string | undefined): numbe
   return null
 }
 
+// A session's transcript is named after it; a new chat's is written with its first message.
+const findTranscript = ($: EngineInterface, sessionId: string) =>
+  $.process
+    .run(['/bin/sh', '-c', 'ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$1".jsonl 2>/dev/null | head -1', 'sh', sessionId])
+    .then(found => found.stdout.trim())
+    .catch(() => '')
+
+const markCompacted = ($: EngineInterface, at: number) =>
+  update($, cache, prev => ({ at, ttlMin: prev?.ttlMin ?? DEFAULT_TTL, model: prev?.model, isCompacted: true }))
+
+// After a main turn: the TTL the writes actually used (5m once on usage
+// credits) and the prompt size a cold cache would re-send.
+async function afterTurn($: EngineInterface, flags: Flags, path: string): Promise<void> {
+  if (!flags.transcript && path) flags.transcript = path
+  if (!flags.transcript && flags.sessionId) flags.transcript = await findTranscript($, flags.sessionId)
+  const tokens = await $.session
+    .usage()
+    .then(u => u.context.tokens)
+    .catch(() => undefined)
+  const file = path || flags.transcript
+  const info = file ? await fromTranscript($, file).catch(() => null) : null
+  await update($, cache, prev => (prev ? { ...prev, ttlMin: info?.ttlMin ?? prev.ttlMin, tokens: tokens ?? info?.tokens ?? prev.tokens } : info))
+  refreshStats($, flags).catch(() => {})
+}
+
+// Between turns, a compaction shows in the transcript as a boundary row after
+// the last response: /compact, or Claude Code's own while idle.
+async function watchTranscript($: EngineInterface, flags: Flags): Promise<void> {
+  if (!flags.transcript || flags.isInTurn || flags.isRunning || flags.isForking) return
+  const { mtimeMs } = await $.fs.stat(flags.transcript)
+  const seen = flags.watched
+  flags.watched = mtimeMs
+  if (seen === 0 || mtimeMs === seen) return
+  const info = await fromTranscript($, flags.transcript)
+  const prev = await read($, cache)
+  if (info?.isCompacted && !(prev?.isCompacted && prev.at === info.at)) await markCompacted($, info.at)
+}
+
 async function seed($: EngineInterface, path: string): Promise<void> {
   await fromTranscript($, path)
     .then(info => info && update($, cache, prev => prev ?? info))
@@ -1443,7 +1486,16 @@ function otherChatsShown(
 
 export const register: Register = (on, options) => {
   const s = settings(options)
-  const flags: Flags = { isRunning: false, isInTurn: false, isForking: false, sessionId: '', transcript: '', label: '', published: '', ticks: 0, listed: null, stats: null, spend: null, statsAt: 0, failures: 0, runOf: new Map(), demoUntil: 0, demoKind: 'mint', demoIndex: 0, isTyped: false, jingle: null, chime: null, askedAt: 0, hasSound: null, week: null, ledger: {}, isBackfilled: false, prompt: null }
+  const flags: Flags = { isRunning: false, isInTurn: false, isForking: false, sessionId: '', transcript: '', label: '', published: '', ticks: 0, listed: null, stats: null, spend: null, statsAt: 0, failures: 0, runOf: new Map(), demoUntil: 0, demoKind: 'mint', demoIndex: 0, isTyped: false, jingle: null, chime: null, askedAt: 0, hasSound: null, week: null, ledger: {}, isBackfilled: false, prompt: null, turnAt: 0, stoppedAt: 0, watched: 0 }
+
+  // Installed twice, from the organization's managed marketplace and from a
+  // user's own folder, the organization's copy runs and the other stays out:
+  // two would show two bands and double keep-warm.
+  on('plugin.register', ($, e, next) =>
+    e.name === $.plugin.name && e.root !== $.plugin.root && e.tier === 'user'
+      ? { refuse: `cache-clock already runs from ${$.plugin.root}` }
+      : next(e),
+  )
 
   // Also runs on a mod (re)load inside an open chat: seed from its transcript so
   // the band shows before the next message.
@@ -1459,12 +1511,7 @@ export const register: Register = (on, options) => {
     const org = await $.env.get('CLAUDE_CODE_ORGANIZATION_UUID').catch(() => undefined)
     scope = org ? `${ORG_PREFIX}${org}/` : ''
     flags.sessionId = await $.session.id().catch(() => '')
-    if (flags.sessionId) {
-      flags.transcript = await $.process
-        .run(['/bin/sh', '-c', 'ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$1".jsonl 2>/dev/null | head -1', 'sh', flags.sessionId])
-        .then(found => found.stdout.trim())
-        .catch(() => '')
-    }
+    if (flags.sessionId) flags.transcript = await findTranscript($, flags.sessionId)
     if (flags.transcript && (await read($, cache)) === null) await seed($, flags.transcript)
     refreshStats($, flags, true).catch(() => {})
 
@@ -1480,6 +1527,7 @@ export const register: Register = (on, options) => {
         .catch(() => {})
       syncAgents($, flags).catch(() => {})
       replayDemo($, s, flags).catch(() => {})
+      watchTranscript($, flags).catch(() => {})
     })
     $.clock.every(10_000, () => {
       maybeRefresh($, s, flags)
@@ -1740,12 +1788,26 @@ export const register: Register = (on, options) => {
   })
 
   on('turn.start', async ($, e, next) => {
-    if (!(e as { agentId?: string }).agentId) flags.isInTurn = true
+    if (!(e as { agentId?: string }).agentId) {
+      flags.isInTurn = true
+      flags.turnAt = await $.clock.now()
+    }
     return next(e)
   })
 
+  // On Team and Enterprise plans the built-in security default passes the
+  // classic hooks on past user mods: without a Stop for this turn shortly
+  // after it ends, its work is done here.
   on('turn.complete', async ($, e, next) => {
-    if (!e.agentId) [flags.isRunning, flags.isInTurn] = [false, false]
+    if (!e.agentId) {
+      ;[flags.isRunning, flags.isInTurn] = [false, false]
+      const began = flags.turnAt || (await $.clock.now())
+      if (!flags.isForking) {
+        $.clock.after(3000, async () => {
+          if (flags.stoppedAt < began && !flags.isInTurn && !flags.isRunning) await afterTurn($, flags, '').catch(() => {})
+        })
+      }
+    }
     return next(e)
   })
 
@@ -1768,29 +1830,12 @@ export const register: Register = (on, options) => {
     return result
   })
 
-  // After the turn: the TTL the writes actually used (5m once on usage credits)
-  // and the prompt size a cold cache would re-send.
-  // After the turn: the TTL the writes actually used (5m once on usage credits)
-  // and the prompt size a cold cache would re-send.
   on('classic.Stop', async ($, e, next) => {
     try {
       if (!e.agent_id) {
         flags.isRunning = false
-        // A new chat's transcript is written with its first message, after the
-        // session started and looked for it: the turn names it.
-        if (!flags.transcript && e.transcript_path) flags.transcript = e.transcript_path
-        const tokens = await $.session
-          .usage()
-          .then(u => u.context.tokens)
-          .catch(() => undefined)
-        await fromTranscript($, e.transcript_path)
-          .then(info =>
-            update($, cache, prev =>
-              prev ? { ...prev, ttlMin: info?.ttlMin ?? prev.ttlMin, tokens: tokens ?? info?.tokens ?? prev.tokens } : info,
-            ),
-          )
-          .catch(() => {})
-        refreshStats($, flags).catch(() => {})
+        flags.stoppedAt = await $.clock.now()
+        await afterTurn($, flags, e.transcript_path)
         // The runs the turn's background-task list no longer names have ended.
         if (e.background_tasks) {
           const live = e.background_tasks.filter(t => t.type === 'workflow')
@@ -1856,8 +1901,7 @@ export const register: Register = (on, options) => {
   on('classic.PostCompact', async ($, e, next) => {
     if (e.agent_id) return next(e)
     try {
-      const mark = (at: number) =>
-        update($, cache, prev => ({ at, ttlMin: prev?.ttlMin ?? DEFAULT_TTL, model: prev?.model, isCompacted: true }))
+      const mark = (at: number) => markCompacted($, at)
       const path = flags.transcript || e.transcript_path
       const info = path ? await fromTranscript($, path).catch(() => null) : null
       if (info === null) await mark(await $.clock.now())

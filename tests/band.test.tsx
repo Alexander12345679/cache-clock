@@ -244,6 +244,32 @@ test("a background subagent's compaction, reported without its agent_id, leaves 
   expect(await compacted.find({ text: /Compacted/ })).toBeDefined()
 })
 
+test("on a Team plan the security default passes Stop and PostCompact on past the mod: the turn's TTL and a /compact still show", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const world = engine(on)
+  let mtimeMs = 1
+  on('fs.stat', () => ({ value: { kind: 'file', size: 1, mtimeMs } }))
+  const at = new Date(1_000_000).toISOString()
+  const row = (o: object) => JSON.stringify({ timestamp: at, isSidechain: false, ...o })
+  await start($)
+  // A new chat: its transcript is written with the first message, on usage credits' 5m.
+  world.transcript = '/p/self.jsonl'
+  world.tail = [
+    row({ type: 'user', message: { role: 'user', content: 'go' } }),
+    row({ type: 'assistant', message: { id: 'm1', model: 'claude-opus-5-5', usage: { ...usage(0, 100_000), cache_creation: { ephemeral_5m_input_tokens: 100_000 } } } }),
+  ].join('\n')
+  await send($)
+  await clock.advance(4_000)
+  const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await band.find({ text: /\(5m TTL\)/ })).toBeDefined()
+
+  world.tail += '\n' + row({ type: 'system', subtype: 'compact_boundary' })
+  mtimeMs = 2
+  await clock.advance(2_000)
+  const compacted = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await compacted.find({ text: /Compacted/ })).toBeDefined()
+})
+
 test('a model switch reads cold until switched back', async ($, on) => {
   mock.clock(on, { now: 1_000_000 })
   engine(on)

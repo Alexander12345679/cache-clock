@@ -2,6 +2,12 @@
 
 Each version is tagged `v<version>`; releases from 0.23.1 on are on the [Releases page](https://github.com/jomplox/cache-clock/releases).
 
+## 0.26.1 (2026-10-20)
+
+- On Team and Enterprise plans, Claude Code's built-in security default runs ahead of user mods and passes the classic hooks (Stop, PostCompact, SessionStart, SubagentStart/Stop, PostModelSwitch) and the compaction hook on without them. The band now does without them where it can. A turn's TTL (5m once on usage credits), its prompt size and the stats are read from the transcript shortly after the turn ends, when no Stop arrived. A `/compact` or Claude Code's own compaction between turns shows as `Compacted` once its boundary row is in the transcript, instead of the old cache going cold.
+- Still missing there: a model switch shows only once the next message is sent, Claude Code's idle compaction isn't deferred for keep-warm or the **Compact** button, and a workflow run ends only when it ages out of the list. An org Owner can seat the mod ahead of the security default with managed `prependPlugins`; see the README.
+- Installed twice, from an organization's managed marketplace and from a folder of your own (`--plugin-dir`, `CLAUDE_CODE_PLUGIN_DIRS`), only the organization's copy loads; the other is refused at load, so one band shows and keep-warm refreshes once. The two keep separate records.
+
 ## 0.26.0 (2026-10-20)
 
 - Two accounts side by side on one Mac (the Graft switcher, a second Claude app) share one Claude Code folder, so the mod's store too. Each chat now keeps its records under its account's organization, which Desktop hands every session: the other chats' list, the week's spend and savings, keep-warm's ledger and the reward's run count only that account's chats. A terminal session, which isn't told its organization, keeps the unprefixed records as before. The Sound button still applies to every chat on the Mac.

@@ -45,6 +45,9 @@ Then open a chat in the **Code** tab, or run `/reload-plugins` in a chat that's 
 > [!NOTE]
 > **Made for Claude Desktop, not the `claude` CLI.** The band, its buttons, the charts and every animation are drawn for Desktop's Code tab. In a terminal session the mod still loads, but you get a plain text line and none of the visuals. It isn't designed or tested there.
 
+> [!NOTE]
+> **On a Team or Enterprise plan**, Claude Code seats its built-in security default (`sec-default@builtin`) ahead of user mods, and it passes the classic hooks on without them: you see `cache-clock` named in "skipped" notices. The band still works from the transcript, but a model switch shows only with the next message, and Claude Code's idle compaction isn't held back for keep-warm. An org Owner can seat the mod first with managed `prependPlugins` (claude.ai: **Organization settings → Claude Code → Managed settings**), e.g. `["cache-clock@<marketplace>", "sec-default@builtin"]`. That only takes a plugin your organization provides: enabled in managed `enabledPlugins`, from a marketplace managed settings name as a local directory on each Mac. A GitHub install like the one above doesn't qualify. Leaving `sec-default@builtin` out of the list removes the security default for the whole organization.
+
 ## ✨ What it does
 
 | | |
