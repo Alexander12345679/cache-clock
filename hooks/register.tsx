@@ -33,6 +33,13 @@ const PING = 'Automatic keep-alive from the cache-clock mod, sent only to refres
 
 // Each session publishes its cache under `chat:<session id>` in the store.
 const CHAT_KEY = 'chat:'
+
+// Two accounts side by side (Graft) share one Claude Code folder and so this
+// store; Desktop gives each session its organization, and the session's keys
+// sit under `org:<id>/`. Without one (a terminal), keys are unprefixed, as before.
+const ORG_PREFIX = 'org:'
+let scope = ''
+const scoped = (key: string) => scope + key
 const DAY = 24 * 3_600_000
 // From this width subagents sit two to a row.
 const WIDE = 110
@@ -202,7 +209,7 @@ async function refreshSpend($: EngineInterface, flags: Flags, now: number): Prom
   flags.spend = parseSpend(out.stdout, since, isWindow)
   if (flags.sessionId) flags.ledger = (await readLedger($, flags.sessionId))?.days ?? {}
   // Published for every chat's week total, kept past this chat's own entry.
-  if (flags.sessionId) await $.store.set(SPEND_KEY + flags.sessionId, { since, total: flags.spend.total, at: now })
+  if (flags.sessionId) await $.store.set(scoped(SPEND_KEY + flags.sessionId), { since, total: flags.spend.total, at: now })
 }
 
 // Each chat's spend this week, and what warm returns saved per day, across chats.
@@ -214,11 +221,11 @@ const dayKey = (at: number) => {
 }
 
 async function addSavedToday($: EngineInterface, at: number, saved: number): Promise<void> {
-  const days = ((await $.store.get(SAVED_DAYS_KEY).catch(() => undefined)) ?? {}) as Record<string, number>
+  const days = ((await $.store.get(scoped(SAVED_DAYS_KEY)).catch(() => undefined)) ?? {}) as Record<string, number>
   const keep = dayKey(at - WEEK - DAY)
   const next = Object.fromEntries(Object.entries(days).filter(([d, v]) => d > keep && typeof v === 'number'))
   next[dayKey(at)] = (next[dayKey(at)] ?? 0) + saved
-  await $.store.set(SAVED_DAYS_KEY, next).catch(() => {})
+  await $.store.set(scoped(SAVED_DAYS_KEY), next).catch(() => {})
 }
 
 // What keep-warm's refreshes cost each day, and what they saved: a return
@@ -246,7 +253,16 @@ function kwSince(days: Record<string, unknown> | undefined, since: number, into 
 type Ledger = { at: number; from: number; days: Record<string, KwDay>; isBackfilled?: boolean }
 
 async function readLedger($: EngineInterface, sessionId: string): Promise<Ledger | undefined> {
-  const v = (await $.store.get(KW_KEY + sessionId).catch(() => undefined)) as Partial<Ledger> | undefined
+  let v = (await $.store.get(scoped(KW_KEY + sessionId)).catch(() => undefined)) as Partial<Ledger> | undefined
+  if (v === undefined && scope) {
+    // Kept unprefixed before accounts were told apart: the account that
+    // opens the chat first takes it over.
+    v = (await $.store.get(KW_KEY + sessionId).catch(() => undefined)) as Partial<Ledger> | undefined
+    if (v !== undefined) {
+      await $.store.set(scoped(KW_KEY + sessionId), v).catch(() => {})
+      await $.store.delete(KW_KEY + sessionId).catch(() => {})
+    }
+  }
   if (!v || typeof v.days !== 'object' || v.days === null) return undefined
   return { at: v.at ?? 0, from: v.from ?? 0, days: v.days, isBackfilled: v.isBackfilled }
 }
@@ -260,7 +276,7 @@ async function addKw($: EngineInterface, flags: Flags, at: number, add: Partial<
   for (const k of KW_FIELDS) day[k] += add[k] ?? 0
   days[dayKey(at)] = day
   flags.ledger = days
-  await $.store.set(KW_KEY + flags.sessionId, { at, from: prev?.from ?? at, ...(prev?.isBackfilled ? { isBackfilled: true } : {}), ...edit, days }).catch(() => {})
+  await $.store.set(scoped(KW_KEY + flags.sessionId), { at, from: prev?.from ?? at, ...(prev?.isBackfilled ? { isBackfilled: true } : {}), ...edit, days }).catch(() => {})
 }
 
 // Keep-warm's refreshes of this chat from before its ledger, from the log
@@ -268,7 +284,7 @@ async function addKw($: EngineInterface, flags: Flags, at: number, add: Partial<
 // fell in, from the transcript: a return past the TTL that read the cache
 // was held, one that rebuilt it was lost. A refresh counts only where this
 // chat sat idle: chats can share a title. Done once per chat.
-const LOG_REFRESHES = 'grep -F -- " $1 · refresh read " "$HOME/.claude/cache-clock.log" 2>/dev/null; true'
+const LOG_REFRESHES = 'grep -F -- " $1 · refresh read " "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache-clock.log" 2>/dev/null; true'
 async function backfillLedger($: EngineInterface, flags: Flags, info: CacheInfo | null, now: number): Promise<void> {
   if (flags.isBackfilled || !flags.sessionId || !flags.label || flags.stats === null) return
   const prev = await readLedger($, flags.sessionId)
@@ -298,7 +314,7 @@ async function backfillLedger($: EngineInterface, flags: Flags, info: CacheInfo 
     else if (g.ms > ttlMin * 60_000 && base !== null) add(g.at, { held: 1, saved: (g.read * base * (writeMult(ttlMin) - readMult)) / 1e6 })
   }
   flags.ledger = days
-  await $.store.set(KW_KEY + flags.sessionId, { at: prev?.at || now, from: until, isBackfilled: true, days }).catch(() => {})
+  await $.store.set(scoped(KW_KEY + flags.sessionId), { at: prev?.at || now, from: until, isBackfilled: true, days }).catch(() => {})
 }
 
 // "≈$0.62 for 9 refreshes, saved ≈$4.10 on 2 returns: paid back 6.6×".
@@ -1057,7 +1073,7 @@ async function refresh($: EngineInterface, flags: Flags, sentAt: number): Promis
 // Keeps the last 500 lines once it passes 1000.
 async function logLine($: EngineInterface, flags: Flags, at: number, text: string): Promise<void> {
   const line = `${new Date(at).toISOString()} ${flags.label || flags.sessionId} · ${text}`
-  const script = 'f="$HOME/.claude/cache-clock.log"; printf "%s\\n" "$1" >> "$f"; [ "$(wc -l < "$f")" -gt 1000 ] && tail -n 500 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; true'
+  const script = 'f="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache-clock.log"; printf "%s\\n" "$1" >> "$f"; [ "$(wc -l < "$f")" -gt 1000 ] && tail -n 500 "$f" > "$f.tmp" && mv "$f.tmp" "$f"; true'
   await $.process.run(['/bin/sh', '-c', script, 'sh', line]).catch(() => {})
 }
 
@@ -1086,7 +1102,7 @@ const MILESTONES = [10, 25, 50, 100, 250, 500, 1000]
 type Totals = { day: string; saved: number; streak: number }
 
 async function readTotals($: EngineInterface, at: number): Promise<Totals> {
-  const v = (await $.store.get(TOTALS_KEY).catch(() => undefined)) as Partial<Totals> | undefined
+  const v = (await $.store.get(scoped(TOTALS_KEY)).catch(() => undefined)) as Partial<Totals> | undefined
   const day = new Date(at).toDateString()
   return { day, saved: v?.day === day && typeof v.saved === 'number' ? v.saved : 0, streak: typeof v?.streak === 'number' ? v.streak : 0 }
 }
@@ -1287,7 +1303,7 @@ async function syncChats($: EngineInterface, s: Settings, flags: Flags): Promise
     // Rewritten when it changes, and every five minutes in case another
     // session's write lost it.
     if (json !== flags.published || flags.ticks % 30 === 0) {
-      await $.store.set(CHAT_KEY + flags.sessionId, { ...entry, updatedAt: now })
+      await $.store.set(scoped(CHAT_KEY + flags.sessionId), { ...entry, updatedAt: now })
       flags.published = json
     }
   }
@@ -1297,26 +1313,32 @@ async function syncChats($: EngineInterface, s: Settings, flags: Flags): Promise
   const since = flags.spend?.since
   let spent = 0
   const kw = kwZero()
-  for (const key of await $.store.keys()) {
+  for (const stored of await $.store.keys()) {
+    // Another account's keys are left alone; unprefixed ones from before
+    // accounts were told apart are only expired.
+    const isLegacy = scope !== '' && !stored.startsWith(ORG_PREFIX)
+    if (!isLegacy && !stored.startsWith(scope)) continue
+    const key = isLegacy ? stored : stored.slice(scope.length)
     if (key.startsWith(KW_KEY)) {
-      const v = (await $.store.get(key)) as { at?: number; days?: Record<string, unknown> } | undefined
-      if (typeof v?.at !== 'number' || now - v.at > WEEK + DAY) await $.store.delete(key)
-      else if (since !== undefined) kwSince(v.days, since, kw)
+      const v = (await $.store.get(stored)) as { at?: number; days?: Record<string, unknown> } | undefined
+      if (typeof v?.at !== 'number' || now - v.at > WEEK + DAY) await $.store.delete(stored)
+      else if (since !== undefined && !isLegacy) kwSince(v.days, since, kw)
       continue
     }
     if (key.startsWith(SPEND_KEY)) {
-      const v = (await $.store.get(key)) as { since?: number; total?: number; at?: number } | undefined
-      if (typeof v?.at !== 'number' || now - v.at > WEEK + DAY) await $.store.delete(key)
-      else if (since !== undefined && v.since === since && typeof v.total === 'number') spent += v.total
+      const v = (await $.store.get(stored)) as { since?: number; total?: number; at?: number } | undefined
+      if (typeof v?.at !== 'number' || now - v.at > WEEK + DAY) await $.store.delete(stored)
+      else if (since !== undefined && !isLegacy && v.since === since && typeof v.total === 'number') spent += v.total
       continue
     }
     if (!key.startsWith(CHAT_KEY) || key === CHAT_KEY + flags.sessionId) continue
-    const v = (await $.store.get(key)) as Partial<OtherChat> | undefined
+    const v = (await $.store.get(stored)) as Partial<OtherChat> | undefined
     if (!v || typeof v.at !== 'number') continue
     if (now - v.at > DAY) {
-      await $.store.delete(key)
+      await $.store.delete(stored)
       continue
     }
+    if (isLegacy) continue
     list.push({ id: key.slice(CHAT_KEY.length), label: String(v.label ?? 'chat'), at: v.at, ttlMin: v.ttlMin === 5 ? 5 : 60, tokens: v.tokens, isCompacted: v.isCompacted })
   }
   // A side chat's transcript carries its parent's title: one entry per title,
@@ -1327,7 +1349,7 @@ async function syncChats($: EngineInterface, s: Settings, flags: Flags): Promise
     if (c.label !== flags.label && (!seen || c.at > seen.at)) latest.set(c.label, c)
   }
   if (since !== undefined) {
-    const days = ((await $.store.get(SAVED_DAYS_KEY).catch(() => undefined)) ?? {}) as Record<string, number>
+    const days = ((await $.store.get(scoped(SAVED_DAYS_KEY)).catch(() => undefined)) ?? {}) as Record<string, number>
     const first = dayKey(since)
     const saved = Object.entries(days).reduce((sum, [d, v]) => (d >= first && typeof v === 'number' ? sum + v : sum), 0)
     flags.week = { saved, spent, kw }
@@ -1434,10 +1456,12 @@ export const register: Register = (on, options) => {
       if (prize !== null && now - prize.at >= 0 && now - prize.at < REWARD_MS) return
       $.ui.invalidate('ui.render')
     })
+    const org = await $.env.get('CLAUDE_CODE_ORGANIZATION_UUID').catch(() => undefined)
+    scope = org ? `${ORG_PREFIX}${org}/` : ''
     flags.sessionId = await $.session.id().catch(() => '')
     if (flags.sessionId) {
       flags.transcript = await $.process
-        .run(['/bin/sh', '-c', 'ls "$HOME"/.claude/projects/*/"$1".jsonl 2>/dev/null | head -1', 'sh', flags.sessionId])
+        .run(['/bin/sh', '-c', 'ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$1".jsonl 2>/dev/null | head -1', 'sh', flags.sessionId])
         .then(found => found.stdout.trim())
         .catch(() => '')
     }
@@ -1649,7 +1673,7 @@ export const register: Register = (on, options) => {
       prize = await startReward($, s, flags, prev, expected, at).catch(() => null)
     } else if (isTyped && prev !== null && expected === undefined && !prev.isCompacted && prev.at + prev.ttlMin * 60_000 <= at) {
       const totals = await readTotals($, at)
-      if (totals.streak > 0) await $.store.set(TOTALS_KEY, { ...totals, streak: 0 }).catch(() => {})
+      if (totals.streak > 0) await $.store.set(scoped(TOTALS_KEY), { ...totals, streak: 0 }).catch(() => {})
     }
 
     const result = yield* next(e)
@@ -1704,7 +1728,7 @@ export const register: Register = (on, options) => {
           await update($, reward, r => (r?.at === won.at ? { ...r, paid, isPaidExact: true } : r))
         }
         await $.store
-          .set(TOTALS_KEY, isMiss ? { ...totals, streak: 0 } : { day: totals.day, saved: totals.saved + won.saved, streak: totals.streak + 1 })
+          .set(scoped(TOTALS_KEY), isMiss ? { ...totals, streak: 0 } : { day: totals.day, saved: totals.saved + won.saved, streak: totals.streak + 1 })
           .catch(() => {})
         if (!isMiss) await addSavedToday($, won.at, won.saved)
       }
@@ -1744,6 +1768,8 @@ export const register: Register = (on, options) => {
     return result
   })
 
+  // After the turn: the TTL the writes actually used (5m once on usage credits)
+  // and the prompt size a cold cache would re-send.
   // After the turn: the TTL the writes actually used (5m once on usage credits)
   // and the prompt size a cold cache would re-send.
   on('classic.Stop', async ($, e, next) => {

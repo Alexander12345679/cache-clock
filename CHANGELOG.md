@@ -2,6 +2,12 @@
 
 Each version is tagged `v<version>`; releases from 0.23.1 on are on the [Releases page](https://github.com/jomplox/cache-clock/releases).
 
+## 0.26.0 (2026-10-20)
+
+- Two accounts side by side on one Mac (the Graft switcher, a second Claude app) share one Claude Code folder, so the mod's store too. Each chat now keeps its records under its account's organization, which Desktop hands every session: the other chats' list, the week's spend and savings, keep-warm's ledger and the reward's run count only that account's chats. A terminal session, which isn't told its organization, keeps the unprefixed records as before. The Sound button still applies to every chat on the Mac.
+- Records from before are left out of the account-scoped lists. A chat's keep-warm ledger moves to the first account that opens the chat; the rest expire as they always did. The week's savings and the reward's run start over for each account.
+- The log, and the search for a chat's transcript, follow `CLAUDE_CONFIG_DIR` when it's set, instead of always `~/.claude`.
+
 ## 0.25.1 (2026-10-16)
 
 - With Stats off, the other chats' row under the band is just the list, labelled `Other chats` and separated by `·`; the week's figures stay with the stats.

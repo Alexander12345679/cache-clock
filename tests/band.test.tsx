@@ -650,6 +650,61 @@ test("the other chats' hover opens with the week across chats: what warm returns
   expect(await off.find({ text: /^ERP$/ })).toBeDefined()
 })
 
+test("two accounts sharing the store (Graft) keep their own chats and week; a chat's old ledger moves to its account", async ($, on) => {
+  const now = 10_000_000_000
+  const clock = mock.clock(on, { now })
+  mock.env(on, { CLAUDE_CODE_ORGANIZATION_UUID: 'org-a' })
+  const world = engine(on)
+  const day = (at: number) => {
+    const d = new Date(at)
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+  }
+  world.transcript = '/p/self.jsonl'
+  world.rateLimits = [{ kind: 'seven_day', percentUsed: 36, resetsAt: new Date(now + 86_400_000).toISOString() }]
+  const since = now + 86_400_000 - 7 * 86_400_000
+  world.spend = ['claude-opus-5-5\t0\t1000000\t0\t0\t10000', 'claude-opus-5-5\t0\t2000000\t100000\t0\t0'].join('\n')
+  const kwDay = { paid: 1, saved: 3, refreshes: 10, held: 2, lost: 1 }
+  // This account's.
+  world.store.set('org:org-a/chat:kiosk', { label: 'Kiosk', at: now - 20 * 60_000, ttlMin: 60 })
+  world.store.set('org:org-a/spend:kiosk', { since, total: 2, at: now - 3_600_000 })
+  world.store.set('org:org-a/reward-days', { [day(now)]: 1 })
+  // The other account's: neither shown nor counted, nor touched.
+  world.store.set('org:org-b/chat:erp', { label: 'ERP', at: now - 20 * 60_000, ttlMin: 60 })
+  world.store.set('org:org-b/spend:erp', { since, total: 8.7, at: now - 3_600_000 })
+  world.store.set('org:org-b/keep-warm:erp', { at: now - 3_600_000, days: { [day(now)]: { ...kwDay, paid: 50 } } })
+  // From before accounts were told apart: this chat's ledger moves over; the
+  // rest is neither shown nor counted, and goes once stale.
+  world.store.set('keep-warm:self', { at: now - 3_600_000, days: { [day(now)]: kwDay } })
+  world.store.set('chat:legacy', { label: 'Legacy', at: now - 20 * 60_000, ttlMin: 60 })
+  world.store.set('chat:stale', { label: 'Stale', at: now - 2 * 86_400_000, ttlMin: 60 })
+  world.store.set('spend:legacy', { since, total: 50, at: now - 3_600_000 })
+  world.store.set('reward-days', { [day(now)]: 2.5 })
+  await start($)
+  world.stepUsage.push(usage(127_000, 0))
+  await send($)
+  await clock.advance(10_000)
+  await clock.advance(10_000)
+
+  expect((world.store.get('org:org-a/chat:self') as any)?.label).toBe('innomed-erp')
+  expect(Math.round((world.store.get('org:org-a/spend:self') as any)?.total * 100)).toBe(130)
+  expect(world.store.has('chat:self')).toBe(false)
+  expect(world.store.has('spend:self')).toBe(false)
+  expect(world.store.has('keep-warm:self')).toBe(false)
+  expect((world.store.get('org:org-a/keep-warm:self') as any)?.days?.[day(now)]?.refreshes).toBe(10)
+  expect(world.store.has('chat:stale')).toBe(false)
+  expect(world.store.has('chat:legacy')).toBe(true)
+  expect((world.store.get('org:org-b/spend:erp') as any)?.total).toBe(8.7)
+  for (const surface of ['desktop', 'terminal'] as const) {
+    const band = await $.ui.mount({ plugin: 'cache-clock', surface, ...BAND(false) })
+    expect(
+      await band.find({ text: 'This week, all chats: saved $1.00 · spent $3.30 · keep-warm ≈$1.00 for 10 refreshes, saved ≈$3.00 on 2 returns: paid back 3.0× · 1 pause went cold anyway   ' }),
+    ).toBeDefined()
+    expect(await band.find({ text: /^Kiosk$/ })).toBeDefined()
+    expect(await band.find({ text: /^ERP$/ })).toBeUndefined()
+    expect(await band.find({ text: /Legacy/ })).toBeUndefined()
+  }
+})
+
 test('/keep-warm now refreshes at once while warm, and refuses when cold', { options: { keepWarm: false } }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const world = engine(on)
