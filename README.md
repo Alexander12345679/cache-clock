@@ -46,7 +46,69 @@ Then open a chat in the **Code** tab, or run `/reload-plugins` in a chat that's 
 > **Made for Claude Desktop, not the `claude` CLI.** The band, its buttons, the charts and every animation are drawn for Desktop's Code tab. In a terminal session the mod still loads, but you get a plain text line and none of the visuals. It isn't designed or tested there.
 
 > [!NOTE]
-> **On a Team or Enterprise plan**, Claude Code seats its built-in security default (`sec-default@builtin`) ahead of user mods, and it passes the classic hooks on without them: you see `cache-clock` named in "skipped" notices. The band still works from the transcript, but a model switch shows only with the next message, and Claude Code's idle compaction isn't held back for keep-warm. An org Owner can seat the mod first with managed `prependPlugins` (claude.ai: **Organization settings → Claude Code → Managed settings**), e.g. `["cache-clock@<marketplace>", "sec-default@builtin"]`. That only takes a plugin your organization provides: enabled in managed `enabledPlugins`, from a marketplace managed settings name as a local directory on each Mac. A GitHub install like the one above doesn't qualify. Leaving `sec-default@builtin` out of the list removes the security default for the whole organization.
+> **On a Team or Enterprise plan**, the band works but misses a few things unless an org Owner sets it up for the organization. See [Team and Enterprise plans](#-team-and-enterprise-plans).
+
+## 🏢 Team and Enterprise plans
+
+On these plans Claude Code runs its built-in security default (`sec-default@builtin`) ahead of user mods, and it passes the classic hooks on without them. You'll see `cache-clock` named in "skipped" notices. The band still works from the transcript: the TTL, prompt size and stats appear a few seconds after each reply, and a `/compact` shows as `Compacted`. What it can't do from there:
+
+- A model switch shows only once you send the next message.
+- Claude Code's own idle compaction isn't held back for keep-warm or the **Compact** button.
+- A workflow run leaves the list only when it ages out.
+
+An org Owner can run the mod ahead of the security default for the whole organization. Claude Code allows that only for a plugin the organization provides from a folder on each Mac, so the GitHub install above doesn't qualify.
+
+<details>
+<summary><b>Set it up for your organization</b> (Owner or Primary Owner)</summary>
+
+**1. Put the mod in a root-owned folder on each Mac.** Only an admin can then change what runs for the organization.
+
+```bash
+git clone https://github.com/jomplox/cache-clock.git ~/cache-clock
+```
+
+```bash
+sudo mkdir -p "/Library/Application Support/ClaudeCode/marketplaces"
+```
+
+```bash
+sudo rsync -a --no-owner --no-group --delete --exclude .git ~/cache-clock/ "/Library/Application Support/ClaudeCode/marketplaces/cache-clock/"
+```
+
+Keep `--no-owner --no-group`: without them `sudo rsync -a` copies your own user onto the files.
+
+**2. Add these keys to the managed settings** on claude.ai: **Organization settings → Claude Code → Managed settings**. Merge them with any settings already there.
+
+```json
+{
+  "extraKnownMarketplaces": {
+    "cache-clock": {
+      "source": { "source": "directory", "path": "/Library/Application Support/ClaudeCode/marketplaces/cache-clock" }
+    }
+  },
+  "enabledPlugins": { "cache-clock@cache-clock": true },
+  "prependPlugins": ["cache-clock@cache-clock", "sec-default@builtin"]
+}
+```
+
+> [!WARNING]
+> Keep `sec-default@builtin` in `prependPlugins`. The list replaces the default order, and leaving it out removes the security default for everyone in the organization.
+
+**3. Quit the Claude app fully and reopen it.** Claude Code reads managed settings at startup and then about hourly. In a new chat, no "skipped" notices name `cache-clock`.
+
+**To update**, pull and run the same `rsync` again:
+
+```bash
+git -C ~/cache-clock pull
+```
+
+```bash
+sudo rsync -a --no-owner --no-group --delete --exclude .git ~/cache-clock/ "/Library/Application Support/ClaudeCode/marketplaces/cache-clock/"
+```
+
+**Also installed for yourself?** In the organization's chats Claude Code loads only the organization's copy and ignores yours. Desktop shows that as one plugin error, which you can ignore. A personal account on the same Mac (for example a second Claude app via Graft) keeps using your own install. The two copies keep separate records, so the organization's starts with an empty week.
+
+</details>
 
 ## ✨ What it does
 
