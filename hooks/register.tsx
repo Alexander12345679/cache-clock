@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, PluginOptions, PromptOrigin, Register } from 'claude-code'
 
-import type { AgentCache, CacheInfo, KeepWarm, OtherChat, Reward, RewardVariant, WorkflowRun } from '../types'
+import type { AgentCache, CacheInfo, KeepWarm, OtherChat, Reward, RewardVariant, Sleep, WorkflowRun } from '../types'
 import { REWARD_EVERYDAY, REWARD_H, REWARD_MS, REWARD_ROOM, REWARD_VARIANTS, catchTime, odometerSvg, rewardSvg } from './reward'
 
 // How Claude Code caches: code.claude.com/docs/en/prompt-caching
@@ -21,6 +21,10 @@ const minted = atom({ plugin: 'cache-clock', key: 'minted' } as const, null)
 const runs = atom({ plugin: 'cache-clock', key: 'runs' } as const, {})
 // The last typed message that reused the warm cache.
 const reward = atom({ plugin: 'cache-clock', key: 'reward' } as const, null)
+// When Compact now was pressed, until its compaction has had time to land.
+const compactAsked = atom({ plugin: 'cache-clock', key: 'compactAsked' } as const, null)
+// The computer's last sleep, as this session's timers saw it.
+const slept = atom({ plugin: 'cache-clock', key: 'slept' } as const, null)
 
 // Main-conversation TTL until the transcript says otherwise: one hour on a
 // subscription within plan usage.
@@ -104,7 +108,8 @@ type Flags = {
   askedAt: number
   /** The Sound button's setting as the store last had it; null until read. */
   hasSound: boolean | null
-  /** Every chat's week, as their sessions published it; null until read. */
+  /** Every chat's week, as their sessions published it; null until read. `kw`
+   * leaves this chat out: its ledger is counted live, from `ledger`. */
   week: { saved: number; spent: number; kw: KwDay } | null
   /** This chat's keep-warm ledger, by day, as the store has it. */
   ledger: Record<string, KwDay>
@@ -117,6 +122,26 @@ type Flags = {
   stoppedAt: number
   /** The transcript's modification time when last looked at; 0 until then. */
   watched: number
+  /** The context window as the engine last broke it down; null until it has. */
+  context: ContextNow | null
+  /** When the 10-second tick last ran; 0 until it has. */
+  tickAt: number
+  /** When this chat's compaction now running began; null when none is. */
+  compactingSince: number | null
+}
+
+// The context window: its size, where auto-compaction runs, and what fills
+// it, as /context estimates it (`estimate`).
+type ContextNow = {
+  /** What the last response was answered over; absent just after a compaction. */
+  tokens?: number
+  /** The compaction window when one is set (as /context counts), else the model's. */
+  window: number
+  /** Absent when auto-compaction is off, or the engine gave no breakdown. */
+  threshold?: number
+  isAutoOff: boolean
+  estimate: number
+  parts: { name: string; tokens: number; kind: 'used' | 'free' | 'buffer' }[]
 }
 
 // What a main request sends ahead of the conversation, where a change
@@ -141,11 +166,17 @@ type ChatStats = {
   gaps: { at: number; ms: number; isCold: boolean; read: number }[]
   /** Every stretch of over 3 minutes without a request, the last open-ended: where keep-warm could have refreshed. */
   idles: { from: number; to: number }[]
+  /** The last turns, oldest first: the prompt each opened with, and how many requests it took. */
+  turns: { total: number; requests: number }[]
 }
 
 // Requests and pauses the charts draw, the most recent.
 const CHART_REQUESTS = 60
 const CHART_GAPS = 30
+// Turns kept for how fast the chat grows, and how many of them must have
+// grown before the pace counts.
+const PACE_TURNS = 12
+const PACE_MIN = 3
 
 // One line per distinct request (epoch seconds, uncached input, cache read,
 // cache write) and per prompt of the person's (epoch seconds, "U").
@@ -340,7 +371,7 @@ const STATS_EVERY = 5 * 60_000
 const STATS_FIRST_EVERY = 60_000
 
 function parseStats(stdout: string): ChatStats | null {
-  const stats: ChatStats = { read: 0, total: 0, rebuilds: 0, rewritten: 0, pauses: [], coldPauses: [], requests: [], gaps: [], idles: [] }
+  const stats: ChatStats = { read: 0, total: 0, rebuilds: 0, rewritten: 0, pauses: [], coldPauses: [], requests: [], gaps: [], idles: [], turns: [] }
   let last: number | null = null
   let isPrompted = false
   for (const line of stdout.split('\n')) {
@@ -370,6 +401,9 @@ function parseStats(stdout: string): ChatStats | null {
       stats.gaps.push({ at, ms: at - last, isCold: isRebuild, read: hit || 0 })
     }
     if (last !== null && at - last > 3 * 60_000) stats.idles.push({ from: last, to: at })
+    const turn = stats.turns[stats.turns.length - 1]
+    if (isPrompted || turn === undefined) stats.turns.push({ total: all, requests: 1 })
+    else turn.requests += 1
     isPrompted = false
     stats.read += hit || 0
     stats.total += all
@@ -379,6 +413,7 @@ function parseStats(stdout: string): ChatStats | null {
   stats.coldPauses.sort((a, b) => a - b)
   stats.requests = stats.requests.slice(-CHART_REQUESTS)
   stats.gaps = stats.gaps.slice(-CHART_GAPS)
+  stats.turns = stats.turns.slice(-PACE_TURNS)
   if (last !== null) stats.idles.push({ from: last, to: Infinity })
   return stats.total > 0 ? stats : null
 }
@@ -435,12 +470,13 @@ function chart(stats: ChatStats, key: string, draw: () => string): string {
   return svg
 }
 const CHART_STYLE = `<style>
-  svg { color-scheme: light dark; --bar: #2a78d6; --bad: #ec835a; --good: #0ca30c; --guide: rgba(120,120,115,.45); --track: rgba(120,120,115,.14) }
-  @media (prefers-color-scheme: dark) { svg { --bar: #3987e5; --guide: rgba(195,194,183,.35); --track: rgba(195,194,183,.06) } }
+  svg { color-scheme: light dark; --bar: #2a78d6; --bad: #ec835a; --good: #0ca30c; --guide: rgba(120,120,115,.45); --track: rgba(120,120,115,.14); --mark: #6b6a64 }
+  @media (prefers-color-scheme: dark) { svg { --bar: #3987e5; --guide: rgba(195,194,183,.35); --track: rgba(195,194,183,.06); --mark: #c3c2b7 } }
   .b { fill: var(--bar); opacity: .8 } .b.x { fill: var(--bad); opacity: .95 } .b.g { fill: var(--good); opacity: .9 }
-  .t { fill: var(--track) }
+  .t { fill: var(--track) } .m { fill: var(--mark) }
   .r { stroke: var(--guide); stroke-width: 1; stroke-dasharray: 3 3; vector-effect: non-scaling-stroke }
   .a { fill: var(--bar); opacity: .18 } .l { fill: none; stroke: var(--bar); stroke-width: 1.5; vector-effect: non-scaling-stroke }
+  .a.x { fill: var(--bad) } .l.x { stroke: var(--bad) }
 </style>`
 
 const svgDoc = (w: number, body: string) =>
@@ -465,8 +501,8 @@ function barChart(values: { h: number; isBad: boolean; isGood?: boolean }[], slo
 
 function readsChart(stats: ChatStats): string {
   return barChart(
-    stats.requests.map(r => ({ h: r.total ? r.read / r.total : 0, isBad: r.isRebuild })),
-    REQUEST_SLOTS,
+    stats.requests.slice(-READ_BARS).map(r => ({ h: r.total ? r.read / r.total : 0, isBad: r.isRebuild })),
+    READ_SLOTS,
   )
 }
 
@@ -485,6 +521,10 @@ function pausesChart(stats: ChatStats, ttlMin: number): string {
 // The charts' slots: the bars sit right-aligned in at least this many.
 const PAUSE_SLOTS = 24
 const REQUEST_SLOTS = 40
+// The reads chart shows as many of the last requests as the pauses chart
+// shows pauses, so its bars are as wide.
+const READ_BARS = CHART_GAPS
+const READ_SLOTS = PAUSE_SLOTS
 
 // Hovering a chart: a row of ticks under it, each over the bars it spans and
 // at least half a cell wide (the desktop's cells are its monospace font's,
@@ -531,26 +571,132 @@ function readsCard(reqs: ChatStats['requests'], now: number): Card {
   }
 }
 
-// A tick's requests on the size chart: the prompt each sent.
-function sizeCard(reqs: ChatStats['requests'], now: number): Card {
+// A tick's requests on the context chart: the context each sent, its share
+// of the window, and what they added; a compaction's drop says so.
+function contextCard(reqs: (ChatStats['requests'][number] & { added?: number })[], window: number | null, now: number): Card {
   const first = reqs[0]!.total
   const last = reqs[reqs.length - 1]!.total
-  return { at: when(reqs[0]!.at, now), text: `${reqs.length > 1 && kTokens(first) !== kTokens(last) ? `${kTokens(first)} → ` : ''}${kTokens(last)} prompt` }
+  const added = reqs.reduce((n, r) => n + (r.added ?? 0), 0)
+  const isCompaction = reqs.some(r => r.isRebuild && (r.added ?? 0) < 0)
+  const share = window ? ` (${Math.round((last / window) * 100)}%)` : ''
+  const change = isCompaction || Math.abs(added) < 500 ? '' : ` · ${added > 0 ? '+' : '−'}${kTokens(Math.abs(added))}`
+  return {
+    at: when(reqs[0]!.at, now),
+    text: `${reqs.length > 1 && kTokens(first) !== kTokens(last) ? `${kTokens(first)} → ` : ''}${kTokens(last)}${share}${change}`,
+    end: isCompaction ? 'compacted' : undefined,
+  }
 }
 
-// The prompt's size per request, as an area: it grows with the conversation
-// and drops at a compaction.
-function sizeChart(stats: ChatStats): string {
+// The context per request against the window (else the largest), as an area:
+// it grows with the conversation and drops at a compaction. The dashed line
+// is where auto-compaction runs; orange once that is a few turns away.
+function contextChart(stats: ChatStats, scale: number | null, threshold: number | undefined, isNear: boolean): string {
   const reqs = stats.requests
-  const max = Math.max(...reqs.map(r => r.total), 1)
+  const max = scale ?? Math.max(...reqs.map(r => r.total), 1)
   const n = Math.max(reqs.length, REQUEST_SLOTS)
   const w = n * 10
   const offset = n - reqs.length
-  const pt = (r: (typeof reqs)[number], i: number) => `${(offset + i) * 10 + 5},${(CHART_H - 1 - (r.total / max) * (CHART_H - 3)).toFixed(1)}`
-  const line = reqs.map(pt).join(' ')
+  const y = (tokens: number) => (CHART_H - 1 - Math.min(1, tokens / max) * (CHART_H - 3)).toFixed(1)
+  const line = reqs.map((r, i) => `${(offset + i) * 10 + 5},${y(r.total)}`).join(' ')
   const first = (offset * 10 + 5).toFixed(0)
   const lastX = ((n - 1) * 10 + 5).toFixed(0)
-  return svgDoc(w, `<polygon class="a" points="${first},${CHART_H} ${line} ${lastX},${CHART_H}"/><polyline class="l" points="${line}"/>`)
+  const x = isNear ? ' x' : ''
+  const guide = threshold === undefined ? '' : `<line class="r" x1="0" x2="${w}" y1="${y(threshold)}" y2="${y(threshold)}"/>`
+  return svgDoc(w, `<polygon class="a${x}" points="${first},${CHART_H} ${line} ${lastX},${CHART_H}"/><polyline class="l${x}" points="${line}"/>${guide}`)
+}
+
+// "200k", "1M": a window's size.
+const windowSize = (n: number) => (n >= 1_000_000 ? `${Math.round(n / 100_000) / 10}M` : kTokens(n))
+
+// The window and what fills it, estimated locally (no request): after each
+// turn, and when the transcript changes between turns (a compaction).
+async function refreshContext($: EngineInterface, flags: Flags): Promise<void> {
+  const { context: c } = await $.session.usage({ breakdown: 'summary' })
+  if (!c.window) return
+  const b = c.breakdown
+  flags.context = {
+    tokens: c.tokens,
+    window: b?.rawMaxTokens ?? c.window,
+    threshold: b?.isAutoCompactEnabled ? b.autoCompactThreshold : undefined,
+    isAutoOff: b?.isAutoCompactEnabled === false,
+    estimate: b?.totalTokens ?? c.tokens ?? 0,
+    parts: (b?.categories ?? []).flatMap(p => (p.kind === 'deferred' || p.tokens <= 0 ? [] : [{ name: p.name, tokens: p.tokens, kind: p.kind }])),
+  }
+}
+
+// How this chat grows: what a turn adds on average (compactions aside) and
+// the median requests a turn takes, over its last turns; null with too few.
+// The average, not the median: turns fill the window by their sum, and a
+// chat of long tasks and short questions has a median that jumps from one
+// to the other as a turn comes or goes.
+function turnPace(stats: ChatStats | null): { grows: number; requests: number } | null {
+  const turns = stats?.turns ?? []
+  const adds = turns.slice(1).map((t, i) => t.total - turns[i]!.total).filter(d => d > 0)
+  if (adds.length < PACE_MIN) return null
+  const median = (xs: number[]) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)]!
+  return { grows: adds.reduce((n, d) => n + d, 0) / adds.length, requests: median(turns.map(t => t.requests)) }
+}
+
+// A compaction's summary, as written out; beside it stays what the breakdown
+// counts outside the conversation (system prompt, tools, memory).
+const SUMMARY_TOKENS = 8_000
+
+// Compacting now against carrying on, at list price. Compacting reads the
+// conversation (from cache while warm; once cold, written again whole), writes
+// the summary, and the next message caches what is left; from then on each
+// request reads that instead of the conversation. Null without a price or a
+// breakdown.
+function compactCosts(tokens: number, ctx: ContextNow, pace: { requests: number } | null, modelId: string | null | undefined, ttlMin: number, isCold: boolean) {
+  const { base, read: readMult } = price(modelId)
+  if (base === null || ctx.parts.length === 0) return null
+  const kept = ctx.parts.filter(p => p.kind === 'used' && p.name !== 'Messages').reduce((n, p) => n + p.tokens, 0) + SUMMARY_TOKENS
+  const cost = (units: number) => (units * base) / 1e6
+  const w = writeMult(ttlMin)
+  const warm = cost(tokens * readMult + SUMMARY_TOKENS * 5 + kept * w)
+  const cold = cost(tokens * w + SUMMARY_TOKENS * 5 + kept * w)
+  const requests = pace?.requests ?? 1
+  const turnNow = cost(tokens * readMult * requests)
+  const turnAfter = cost(kept * readMult * requests)
+  // Once cold, the next message writes the conversation again either way.
+  const extra = isCold ? cold - cost(tokens * w) : warm
+  const payback = turnNow > turnAfter ? Math.max(1, Math.ceil(extra / (turnNow - turnAfter))) : null
+  return { warm, cold, rewrite: cost(tokens * w), turnNow, turnAfter, payback }
+}
+
+// Turns until the context reaches where auto-compaction runs (or, with it
+// off, the window's end), at this chat's pace; null without one.
+function turnsLeft(tokens: number, ctx: ContextNow, pace: { grows: number } | null): number | null {
+  return pace === null ? null : Math.max(0, Math.ceil(((ctx.threshold ?? ctx.window) - tokens) / pace.grows))
+}
+
+const turnsText = (n: number) => `${n} ${n === 1 ? 'turn' : 'turns'}`
+const about = (n: number) => (n < 0.005 ? '<$0.01' : `≈${usd(n)}`)
+
+// Whether to compact now: wait while work runs; compact when auto-compaction
+// is a few turns away (better at a break of your choosing than mid-task), or
+// when most of the room is used and compacting soon pays for itself.
+function compactAdvice(
+  tokens: number,
+  ctx: ContextNow,
+  left: number | null,
+  pace: { grows: number } | null,
+  costs: ReturnType<typeof compactCosts>,
+  work: { count: number; label: string },
+  isWorking: boolean,
+): { label: string; color?: 'success' | 'warning'; why: string } {
+  if (isWorking) return { label: 'Wait', why: 'a turn is running' }
+  if (work.count > 0) return { label: 'Wait', why: `${work.label} still running` }
+  const limit = ctx.threshold ?? ctx.window
+  const ends = ctx.threshold !== undefined ? 'auto-compaction' : 'the window fills'
+  // The pace the turns are counted at, so a long task's or a short question's
+  // turn can be held up against it.
+  const at = pace !== null ? ` at ~${kTokens(Math.round(pace.grows))} a turn` : ''
+  if (left !== null && left <= 3) return { label: 'Compact now', color: 'warning', why: left === 0 ? `${ends} at your next message` : `${ends} in ~${turnsText(left)}${at}` }
+  const payback = costs?.payback ?? null
+  const isFull = tokens >= 0.6 * limit
+  if (isFull && payback !== null && payback <= 5) return { label: 'Compact now', color: 'success', why: `pays back in ~${turnsText(payback)}` }
+  if (isFull && payback !== null) return { label: 'Wait', why: `compacting pays back only after ~${turnsText(payback)}` }
+  return { label: 'Wait', why: left !== null ? `room for ~${turnsText(left)}${at}` : `${Math.round((tokens / limit) * 100)}% of the room used` }
 }
 
 // The reads chart's caption, short enough for a third of the band.
@@ -678,6 +824,27 @@ function mintSvg(at: number, elapsedMs = 0): string {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${MINT_W} ${MINT_H}" width="${MINT_W}" height="${MINT_H}" preserveAspectRatio="xMinYMid slice" shape-rendering="crispEdges"><!-- minted ${at} -->${body}</svg>`
 }
 
+// Keep-warm's week: this chat's, plus the other chats' of this account once
+// their ledgers have been read; your plan's weekly window, else 7 days.
+function kwWeek(spend: ChatSpend | null, ledger: Record<string, KwDay>, others: KwDay | null, now: number) {
+  const week = kwSince(ledger, spend?.since ?? now - WEEK, others ? { ...others } : undefined)
+  return { week, span: spend?.isWindow ? 'this week' : 'in 7 days', label: others ? 'Keep-warm, all chats' : 'Keep-warm' }
+}
+
+// Keep-warm's week as a bullet: what its held returns saved (the bar)
+// against what its refreshes paid (the marker), on one dollar scale.
+const KW_W = 72
+const KW_H = 12
+function kwBullet(w: KwDay): string {
+  const max = Math.max(w.paid, w.saved)
+  const x = (n: number) => (max > 0 ? (n / max) * (KW_W - 2) : 0)
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${KW_W} ${KW_H}" width="${KW_W}" height="${KW_H}">${CHART_STYLE}` +
+    `<rect class="t" x="0" y="3" width="${KW_W}" height="6"/><rect class="b g" x="0" y="3" width="${x(w.saved).toFixed(1)}" height="6"/>` +
+    `<rect class="m" x="${x(w.paid).toFixed(1)}" y="0" width="2" height="${KW_H}"/></svg>`
+  )
+}
+
 function readsCaption(stats: ChatStats): string {
   const pct = Math.round((stats.read / stats.total) * 100)
   return ` ${pct}% · ${stats.rebuilds ? `${stats.rebuilds} ${stats.rebuilds === 1 ? 'rebuild' : 'rebuilds'}` : 'no rebuilds'}`
@@ -687,7 +854,7 @@ function readsCaption(stats: ChatStats): string {
 // cost, what keep-warm paid to keep it this pause, how the cache has done in
 // this chat, how the person's pauses compare with its TTL, and whether
 // keep-warm has paid for itself this week.
-function statLines(info: CacheInfo | null, current: string | null, kw: KeepWarm, stats: ChatStats | null, spend: ChatSpend | null, ledger: Record<string, KwDay>, now: number) {
+function statLines(info: CacheInfo | null, current: string | null, kw: KeepWarm, stats: ChatStats | null, spend: ChatSpend | null, ledger: Record<string, KwDay>, others: KwDay | null, now: number) {
   const lines: { key: string; label: string; value: string }[] = []
   const ttlMin = info?.ttlMin ?? DEFAULT_TTL
   const p = price(info?.model ?? current)
@@ -718,18 +885,13 @@ function statLines(info: CacheInfo | null, current: string | null, kw: KeepWarm,
     if (stats.pauses.length >= 3) {
       const median = stats.pauses[Math.floor(stats.pauses.length / 2)] ?? 0
       const over = stats.pauses.filter(ms => ms > ttlMin * 60_000).length
-      const kept = over - stats.coldPauses.filter(ms => ms > ttlMin * 60_000).length
-      const warm = kept > 0 ? ` (${kept === over ? 'all' : kept} kept warm)` : ''
-      lines.push({
-        key: 'pace',
-        label: 'Your pauses',
-        value: ` typically ${duration(median)} · ${over} over ${ttlMin === 60 ? '1h' : '5m'}${warm}`,
-      })
+      const cold = stats.coldPauses.filter(ms => ms > ttlMin * 60_000).length
+      const counts = over === 0 ? `none over ${ttlMin === 60 ? '1h' : '5m'}` : [cold > 0 ? `${cold} cold` : '', over > cold ? `${over - cold} kept` : ''].filter(Boolean).join(' · ')
+      lines.push({ key: 'pace', label: 'Your pauses', value: ` median ${duration(median)} · ${counts}` })
     }
   }
-  const week = kwSince(ledger, spend?.since ?? now - WEEK)
-  const span = spend?.isWindow ? 'this week' : 'in 7 days'
-  lines.push({ key: 'keepwarm', label: 'Keep-warm', value: week.refreshes > 0 ? ` ${span} ${kwVerdict(week)}` : ` no refreshes ${span}, nothing spent` })
+  const { week, span, label } = kwWeek(spend, ledger, others, now)
+  lines.push({ key: 'keepwarm', label, value: week.refreshes > 0 ? ` ${span} ${kwVerdict(week)}` : ` no refreshes ${span}, nothing spent` })
   return lines
 }
 
@@ -838,6 +1000,7 @@ async function afterTurn($: EngineInterface, flags: Flags, path: string): Promis
   const info = file ? await fromTranscript($, file).catch(() => null) : null
   await update($, cache, prev => (prev ? { ...prev, ttlMin: info?.ttlMin ?? prev.ttlMin, tokens: tokens ?? info?.tokens ?? prev.tokens } : info))
   refreshStats($, flags).catch(() => {})
+  refreshContext($, flags).catch(() => {})
 }
 
 // Between turns, a compaction shows in the transcript as a boundary row after
@@ -848,6 +1011,7 @@ async function watchTranscript($: EngineInterface, flags: Flags): Promise<void> 
   const seen = flags.watched
   flags.watched = mtimeMs
   if (seen === 0 || mtimeMs === seen) return
+  refreshContext($, flags).catch(() => {})
   const info = await fromTranscript($, flags.transcript)
   const prev = await read($, cache)
   if (info?.isCompacted && !(prev?.isCompacted && prev.at === info.at)) await markCompacted($, info.at)
@@ -1312,6 +1476,39 @@ async function maybeAlert($: EngineInterface, s: Settings, flags: Flags): Promis
   if (s.alert === 'toast+sound') await playSound($, 'sounds/expiring.wav')
 }
 
+// The computer's sleep stops this session's timers with it: a gap this long
+// between two of the 10-second ticks is one. Its brief wakes in between, a
+// few seconds each, run a tick or two; a gap that starts this soon after the
+// last one ended extends it. Awake that long after, the sleep is over, and
+// the log says so when the cache expired during it.
+const SLEEP_GAP = 60_000
+const SLEEP_JOIN = 120_000
+
+async function noteSleep($: EngineInterface, flags: Flags): Promise<void> {
+  const now = await $.clock.now()
+  const last = flags.tickAt
+  flags.tickAt = now
+  const prev = await read($, slept)
+  if (last > 0 && now - last > SLEEP_GAP) {
+    const from = prev !== null && last - prev.to < SLEEP_JOIN ? prev.from : last
+    await update($, slept, () => ({ from, to: now }))
+    return
+  }
+  if (prev === null || prev.isLogged || now - prev.to < SLEEP_JOIN) return
+  await update($, slept, p => p && { ...p, isLogged: true })
+  const expired = expiredAsleep(await read($, cache), prev)
+  if (expired !== null) await logLine($, flags, now, `cache expired at ${when(expired, now)} while the computer slept (${asleep(prev, now)})`)
+}
+
+// When the cache expired during this sleep, or null when it did not.
+function expiredAsleep(info: CacheInfo | null, sleep: Sleep | null): number | null {
+  if (info === null || info.isCompacted || sleep === null) return null
+  const at = info.at + info.ttlMin * 60_000
+  return at > sleep.from && at <= sleep.to ? at : null
+}
+
+const asleep = (sleep: Sleep, now: number) => `${when(sleep.from, now)}–${when(sleep.to, now)}`
+
 // Why Claude Code's idle compaction should not run now, or null to let it:
 // keep-warm will refresh this cache (auto judged as at its refresh), or
 // compacting is off for this chat.
@@ -1365,7 +1562,7 @@ async function syncChats($: EngineInterface, s: Settings, flags: Flags): Promise
     if (key.startsWith(KW_KEY)) {
       const v = (await $.store.get(stored)) as { at?: number; days?: Record<string, unknown> } | undefined
       if (typeof v?.at !== 'number' || now - v.at > WEEK + DAY) await $.store.delete(stored)
-      else if (since !== undefined && !isLegacy) kwSince(v.days, since, kw)
+      else if (since !== undefined && !isLegacy && key !== KW_KEY + flags.sessionId) kwSince(v.days, since, kw)
       continue
     }
     if (key.startsWith(SPEND_KEY)) {
@@ -1405,8 +1602,9 @@ async function syncChats($: EngineInterface, s: Settings, flags: Flags): Promise
 
 // The main conversation's line: the status whole, the rest one clipped row
 // that gives way to the width before the buttons do; `current` is the
-// session's model since the last switch.
-function mainLine({ Box, Text }: Pick<Elements['desktop'], 'Box' | 'Text'>, isWorking: boolean, info: CacheInfo, now: number, current: string | null) {
+// session's model since the last switch, `sleep` the computer's last. A
+// hovered button's tip, first in that row, pushes the rest out of it.
+function mainLine({ Box, Text }: Pick<Elements['desktop'], 'Box' | 'Text'>, isWorking: boolean, info: CacheInfo, now: number, current: string | null, sleep: Sleep | null, compactingSince: number | null, tips: JSX.Element[]) {
   // What the next message pays to write the conversation again, at list price.
   const base = price(info.model ?? current).base
   const cost = info.tokens && base !== null ? `≈$${((info.tokens * base * writeMult(info.ttlMin)) / 1e6).toFixed(2)}` : null
@@ -1414,7 +1612,8 @@ function mainLine({ Box, Text }: Pick<Elements['desktop'], 'Box' | 'Text'>, isWo
     <Box key="main-head" flexShrink={0}>
       <Text color={color}>{head}</Text>
     </Box>,
-    <Box key="main-rest" flexShrink={1} height={1} overflow="hidden" alignItems="flex-start">
+    <Box key="main-rest" flexShrink={1} flexDirection="column" height={1} overflow="hidden">
+      {tips}
       <Text dimColor wrap="truncate-end">
         {rest}
       </Text>
@@ -1426,15 +1625,18 @@ function mainLine({ Box, Text }: Pick<Elements['desktop'], 'Box' | 'Text'>, isWo
   const ttl = info.ttlMin === 60 ? '1h' : '5m'
   const size = info.tokens ? ` · ${kTokens(info.tokens)} cached` : ''
 
+  if (compactingSince !== null) return line('cyan', '◐ Compacting', ` · writing the summary, ${clock(now - compactingSince)} so far; the chat shows it when done`)
   if (info.isCompacted && !isWorking) return line('cyan', '◐ Compacted', ' · new context not cached yet; the next message caches the summary')
   if (current && info.model && current !== info.model && !isWorking) return line('red', '○ Cache cold', ` · switched to ${current}; ${resend}`)
   // Each request of the turn reads the cache and starts its timer again.
   if (isWorking) return line('green', '● Cache warm', ` · turn running (${ttl} TTL)${size}`)
 
   const left = info.at + info.ttlMin * 60_000 - now
-  if (left <= 0) return line('red', '○ Cache cold', ` · expired ${clock(-left)} ago; ${resend}`)
+  // Asleep, keep-warm could not refresh it, nor compacting compact it.
+  const whileAsleep = sleep !== null && expiredAsleep(info, sleep) !== null ? ` while the computer slept (${asleep(sleep, now)})` : ''
+  if (left <= 0) return line('red', '○ Cache cold', ` · expired ${clock(-left)} ago${whileAsleep}; ${resend}`)
   const isLow = left < alertLead(info.ttlMin)
-  return line(isLow ? 'yellow' : 'green', '● Cache warm', ` · ${clock(left)} left (${ttl} TTL)${size}${cost ? ` (${cost} if it goes cold)` : ''}`)
+  return line(isLow ? 'yellow' : 'green', '● Cache warm', ` · ${clock(left)} left (${ttl} TTL)${size}${cost ? ` · ${cost} if cold` : ''}`)
 }
 
 // The line while a reward plays: room for Clawd and his prop, then what the
@@ -1486,7 +1688,7 @@ function otherChatsShown(
 
 export const register: Register = (on, options) => {
   const s = settings(options)
-  const flags: Flags = { isRunning: false, isInTurn: false, isForking: false, sessionId: '', transcript: '', label: '', published: '', ticks: 0, listed: null, stats: null, spend: null, statsAt: 0, failures: 0, runOf: new Map(), demoUntil: 0, demoKind: 'mint', demoIndex: 0, isTyped: false, jingle: null, chime: null, askedAt: 0, hasSound: null, week: null, ledger: {}, isBackfilled: false, prompt: null, turnAt: 0, stoppedAt: 0, watched: 0 }
+  const flags: Flags = { isRunning: false, isInTurn: false, isForking: false, sessionId: '', transcript: '', label: '', published: '', ticks: 0, listed: null, stats: null, spend: null, statsAt: 0, failures: 0, runOf: new Map(), demoUntil: 0, demoKind: 'mint', demoIndex: 0, isTyped: false, jingle: null, chime: null, askedAt: 0, hasSound: null, week: null, ledger: {}, isBackfilled: false, prompt: null, turnAt: 0, stoppedAt: 0, watched: 0, context: null, tickAt: 0, compactingSince: null }
 
   // Installed twice, from the organization's managed marketplace and from a
   // user's own folder, the organization's copy runs and the other stays out:
@@ -1514,6 +1716,7 @@ export const register: Register = (on, options) => {
     if (flags.sessionId) flags.transcript = await findTranscript($, flags.sessionId)
     if (flags.transcript && (await read($, cache)) === null) await seed($, flags.transcript)
     refreshStats($, flags, true).catch(() => {})
+    refreshContext($, flags).catch(() => {})
 
     await $.command
       .register({ name: 'keep-warm', description: "Keep this chat's prompt cache warm while idle (on/auto/off)", argumentHint: '[on|auto|off|now]', immediate: true })
@@ -1530,6 +1733,7 @@ export const register: Register = (on, options) => {
       watchTranscript($, flags).catch(() => {})
     })
     $.clock.every(10_000, () => {
+      noteSleep($, flags).catch(() => {})
       maybeRefresh($, s, flags)
         .then(() => maybeCompact($, s, flags))
         .catch(() => {})
@@ -1610,6 +1814,8 @@ export const register: Register = (on, options) => {
           flags.label = e.session_title ?? ''
           flags.published = ''
           flags.stats = null
+          flags.context = null
+          refreshContext($, flags).catch(() => {})
           const info = await fromTranscript($, e.transcript_path).catch(() => null)
           await update($, cache, () => info)
           await update($, model, () => null)
@@ -1818,14 +2024,25 @@ export const register: Register = (on, options) => {
   // `plugin`. Keep-warm and the Compact button decide: while keep-warm will
   // still refresh this cache, or with compacting off, it is skipped.
   on('session.compact', async ($, e, next) => {
-    if (e.agentId || e.trigger !== 'auto' || flags.isInTurn || flags.isRunning) return next(e)
+    if (e.agentId || e.trigger === 'precompute') return next(e)
+    // The summary takes a minute, and Desktop shows a compaction it did not
+    // start only once it lands: the band says it is running meanwhile.
+    const run = async () => {
+      flags.compactingSince = await $.clock.now()
+      try {
+        return await next(e)
+      } finally {
+        flags.compactingSince = null
+      }
+    }
+    if (e.trigger !== 'auto' || flags.isInTurn || flags.isRunning) return run()
     const now = await $.clock.now()
     const why = await idleVeto($, s, flags, now)
     if (why !== null) {
       await logLine($, flags, now, `Claude Code's idle compaction skipped (${why})`)
       return { skip: `cache-clock: ${why}` }
     }
-    const result = await next(e)
+    const result = await run()
     if (result.skip === undefined) await logLine($, flags, now, `compacted while idle by Claude Code`)
     return result
   })
@@ -1971,13 +2188,14 @@ export const register: Register = (on, options) => {
     // the list itself on hover.
     const chats = s.otherChats ? otherChatsShown(await read($, others), now) : []
     const isStatsOn = (await read($, showStats)) ?? s.stats
+    const isCompactAsked = (await read($, compactAsked)) !== null
     // The week's figures are stats: with Stats off the list stands alone, labelled.
     const week = isStatsOn && flags.week !== null && flags.week.spent + flags.week.saved >= 0.005 ? flags.week : null
     const chatList =
       chats.length > 0 ? (
         <Text key="chat-list" wrap="truncate-end">
           {week !== null ? (
-            <Text>{`This week, all chats: saved ${usd(week.saved)} · spent ${usd(week.spent)}${week.kw.paid >= 0.005 ? ` · keep-warm ${kwVerdict(week.kw)}` : ''}   `}</Text>
+            <Text>{`This week, all chats: saved ${usd(week.saved)} · spent ${usd(week.spent)}   `}</Text>
           ) : isStatsOn ? null : (
             <Text>Other chats  </Text>
           )}
@@ -1997,12 +2215,13 @@ export const register: Register = (on, options) => {
     const isRewarding = Svg !== null && e.surface !== 'terminal' && prize !== null && now - prize.at >= 0 && now - prize.at < REWARD_MS
     const mint = await read($, minted)
     const isMinting = !isRewarding && Svg !== null && e.surface !== 'terminal' && mint !== null && now - mint.at >= 0 && now - mint.at < MINT_MS
-    const allStats = isStatsOn ? statLines(info, current, kw, flags.stats, flags.spend, flags.ledger, now) : []
+    const allStats = isStatsOn ? statLines(info, current, kw, flags.stats, flags.spend, flags.ledger, flags.week?.kw ?? null, now) : []
     // Where the surface draws SVG, this chat's history goes to charts, each
-    // captioned with its stat line; the text row keeps what has no chart.
+    // captioned with its stat line, and keep-warm's week to a row above them;
+    // the cold cost is on this chat's line already.
     const charted = Svg !== null && flags.stats !== null && flags.stats.requests.length > 1
     const caption = (key: string) => allStats.find(l => l.key === key)
-    const stats = charted ? allStats.filter(l => l.key === 'cold' || l.key === 'payoff' || l.key === 'keepwarm') : allStats
+    const stats = charted ? [] : allStats
     const statText =
       stats.length > 0 ? (
         <Text key="stats" wrap="truncate-end">
@@ -2050,6 +2269,130 @@ export const register: Register = (on, options) => {
             ))}
           </Box>
         ) : null
+      // Whether to compact now, and what would compact this chat on its own.
+      // Just after a compaction the window's figure is the breakdown's estimate.
+      const ctx = flags.context
+      const isEstimate = info.isCompacted === true && ctx?.tokens === undefined
+      const ctxTokens = info.isCompacted ? (ctx?.tokens ?? ctx?.estimate) : (info.tokens ?? ctx?.tokens)
+      const pace = turnPace(flags.stats)
+      const left = ctx !== null && ctxTokens !== undefined ? turnsLeft(ctxTokens, ctx, pace) : null
+      const isLive = liveLeft(info, current, now) !== null
+      // The verdict, Stats on or off: its orange turns Compact now orange too.
+      // None while a compaction runs.
+      const isAdvised = ctx !== null && ctxTokens !== undefined && !info.isCompacted && flags.compactingSince === null
+      const costs = isAdvised ? compactCosts(ctxTokens, ctx, pace, info.model ?? current, info.ttlMin, !isLive) : null
+      const advised = isAdvised ? compactAdvice(ctxTokens, ctx, left, pace, costs, work, e.props.isWorking) : null
+      type Item = { label: string; color?: 'success' | 'warning'; value: string }
+      const advice: { key: string; items: Item[] }[] = []
+      // Over the charts the verdict is one row, with what compacting costs
+      // and when the mod would; what it costs a turn on its hover. Where
+      // auto-compaction runs is the context chart's.
+      let decide: { row: Item; card: Item[] } | null = null
+      if (isStatsOn && ctx !== null && ctxTokens !== undefined) {
+        // Keep-warm refreshes this long before each expiry, its refreshes
+        // left; the mod compacts at the next one after.
+        let modAt: number | null = null
+        if (isCompactOn && !info.isCompacted && isLive && !kw.stopped) {
+          const gap = info.ttlMin * 60_000 - refreshLead(info.ttlMin)
+          modAt = !isOn ? ((info.tokens ?? 0) >= COMPACT_MIN ? info.at + gap : null) : info.at + (kw.isDeclined ? 1 : Math.max(0, limit - kw.refreshes) + 1) * gap
+        }
+        if (advised !== null) {
+          const a = advised
+          const verdict: Item = { label: a.label, ...(a.color ? { color: a.color } : {}), value: ` ${a.why}` }
+          const mod = !isCompactOn ? " · mod won't compact" : modAt !== null ? ` · mod compacts by ${clockTime(modAt)} if away` : ''
+          if (costs === null) {
+            advice.push({ key: 'advice', items: [verdict] })
+            decide = { row: { ...verdict, value: verdict.value + mod }, card: [] }
+          } else {
+            const compacting = isLive
+              ? ` ${about(costs.warm)} now, ${about(costs.cold)} once cold`
+              : ` ${about(costs.cold)} (your next message re-caches ${about(costs.rewrite)} anyway)`
+            advice.push({ key: 'advice', items: [verdict, { label: 'Compacting', value: compacting }] })
+            const payback = costs.payback !== null && !a.why.includes('pays back') ? ` · pays back in ~${turnsText(costs.payback)}` : ''
+            const perTurn = ` ${about(costs.turnNow)} now, ${about(costs.turnAfter)} after compacting`
+            advice.push({ key: 'turn', items: [{ label: 'Per turn', value: perTurn + payback }] })
+            decide = {
+              row: { ...verdict, value: `${verdict.value} · compacting ${about(isLive ? costs.warm : costs.cold)}${payback}${mod}` },
+              card: [
+                { label: 'Compacting', value: compacting },
+                { label: 'Per turn', value: perTurn },
+              ],
+            }
+          }
+        }
+        const own: string[] = []
+        if (ctx.isAutoOff) own.push('auto-compaction is off')
+        else if (ctx.threshold !== undefined) own.push(`auto-compacts at ${kTokens(ctx.threshold)}`)
+        if (!isCompactOn) own.push("the mod won't compact (Compact is off)")
+        else if (modAt !== null) own.push(`the mod compacts by ${clockTime(modAt)} if you're away`)
+        if (own.length > 0) advice.push({ key: 'own', items: [{ label: 'On its own', value: ` ${own.join(' · ')}` }] })
+      }
+      // Labelled items in a row; with a scope, hovering any of it lights that
+      // group. Wrapped, they run on to the next line instead of being cut.
+      const itemsText = (key: string, items: Item[], scope?: string, isWrapped = false) => {
+        const hover = scope ? { hover: { scope } } : {}
+        return (
+          <Text key={key} wrap={isWrapped ? 'wrap' : 'truncate-end'}>
+            {items.map((item, i) => (
+              <Text key={`${key}-${i}`}>
+                <Text {...hover} {...(item.color ? { color: item.color } : {})}>{`${i > 0 ? '    ' : ''}${item.label}`}</Text>
+                <Text {...hover} dimColor>
+                  {item.value}
+                </Text>
+              </Text>
+            ))}
+          </Text>
+        )
+      }
+      const adviceRows = charted
+        ? []
+        : advice.map(row => (
+            <Box key={row.key} height={1} overflow="hidden">
+              {itemsText(`${row.key}-text`, row.items)}
+            </Box>
+          ))
+      // Keep-warm's week beside the verdict: its net, then the bullet; the
+      // sentence and this pause's refreshes on its hover.
+      const kwRow = (() => {
+        if (!isStatsOn || !charted || Svg === null) return null
+        const { week, span, label } = kwWeek(flags.spend, flags.ledger, flags.week?.kw ?? null, now)
+        if (week.refreshes === 0) return { row: itemsText('kw-none', [{ label, value: ` nothing spent ${span}` }], undefined, true), card: null }
+        const net = week.saved - week.paid
+        const payoff = caption('payoff')
+        const hover = { scope: 'kw-week' }
+        return {
+          row: (
+            <Box key="kw" alignItems="center">
+              <Text wrap="wrap">
+                <Text hover={hover}>{`${label} `}</Text>
+                <Text hover={hover} color={net < 0 ? 'warning' : 'success'}>{`${net < 0 ? '−' : '+'}${usd(Math.abs(net))}`}</Text>
+                <Text hover={hover} dimColor>{` ${span} `}</Text>
+              </Text>
+              <Svg key="kw-bullet" source={kwBullet(week)} alt={`${label} ${span}: spent ${usd(week.paid)}, saved ${usd(week.saved)}`} width={KW_W} height={KW_H} />
+            </Box>
+          ),
+          card: [{ label, value: ` ${span} ${kwVerdict(week)}` }, ...(payoff ? [{ label: payoff.label, value: payoff.value }] : [])],
+        }
+      })()
+      const shownDecide = charted ? decide : null
+      const top =
+        shownDecide !== null || kwRow !== null ? (
+          <Box key="top" flexShrink={0} height={2}>
+            {shownDecide !== null ? (
+              <Box flexShrink={1} height={2} overflow="hidden" alignItems="flex-start">
+                {itemsText('decide', [shownDecide.row], 'decide', true)}
+              </Box>
+            ) : null}
+            {/* Two lines: both give way by their length, and wrap. */}
+            {kwRow !== null ? (
+              <Box flexShrink={1} height={2} overflow="hidden" alignItems="flex-start" marginLeft={shownDecide !== null ? 4 : 0}>
+                {kwRow.row}
+              </Box>
+            ) : null}
+          </Box>
+        ) : null
+      // The first rows of the stats box: two over the charts, else one.
+      const headRows = top !== null ? 2 : 1
       const isSwapped = chatList !== null && (statText !== null || (isStatsOn && charted))
       const tile = (key: string, label: string, value: string, chartEl: JSX.Element | null, cards: JSX.Element[] = []) => (
         <Box key={`tile-${key}`} flexDirection="column" width="32%" overflow="hidden">
@@ -2109,20 +2452,103 @@ export const register: Register = (on, options) => {
       const tiles = (() => {
         if (!isStatsOn || !charted || flags.stats === null || Svg === null) return null
         const stats = flags.stats
-        const reads = ticked('reads', svgChart('reads', chart(stats, 'reads', () => readsChart(stats)), 'Share of each request read from cache'), stats.requests, REQUEST_SLOTS, g => readsCard(g, now))
+        const reads = ticked('reads', svgChart('reads', chart(stats, 'reads', () => readsChart(stats)), 'Share of each request read from cache'), stats.requests.slice(-READ_BARS), READ_SLOTS, g =>
+          readsCard(g, now),
+        )
         // A tick spanning several pauses shows the longest.
         const pauses = ticked('pause', svgChart('pauses', chart(stats, `pauses-${info.ttlMin}`, () => pausesChart(stats, info.ttlMin)), 'Your pauses against the cache TTL'), stats.gaps, PAUSE_SLOTS, g =>
           pauseCard(g.reduce((a, b) => (b.ms > a.ms ? b : a)), info.ttlMin, now),
         )
-        const size = ticked('size', svgChart('size', chart(stats, 'size', () => sizeChart(stats)), 'Prompt size per request'), stats.requests, REQUEST_SLOTS, g => sizeCard(g, now))
+        // The context against the window, where auto-compaction runs dashed.
+        const isNear = left !== null && left <= 3
+        const scale = ctx?.window ?? null
+        const sent = stats.requests.map((r, i) => ({ ...r, added: i > 0 ? r.total - stats.requests[i - 1]!.total : undefined }))
+        const context = ticked(
+          'context',
+          svgChart('context', chart(stats, `context-${scale}-${ctx?.threshold}-${isNear}`, () => contextChart(stats, scale, ctx?.threshold, isNear)), 'Context per request against the window'),
+          sent,
+          REQUEST_SLOTS,
+          g => contextCard(g, scale, now),
+        )
+        const shown = ctxTokens ?? stats.requests[stats.requests.length - 1]?.total ?? 0
+        // Then where it ends: at this chat's pace, in so many turns; else where.
+        const ends =
+          ctx === null
+            ? ''
+            : left !== null
+              ? ` · ${ctx.threshold !== undefined ? 'auto' : 'full'} ${left === 0 ? 'next turn' : `in ~${turnsText(left)}`}`
+              : ctx.threshold !== undefined
+                ? ` · auto at ${kTokens(ctx.threshold)}`
+                : ctx.isAutoOff
+                  ? ' · auto off'
+                  : ''
+        const ctxCaption = ctx === null ? ` ${kTokens(shown)} now` : ` ${isEstimate ? '≈' : ''}${kTokens(shown)} of ${windowSize(ctx.window)} · ${Math.round((shown / ctx.window) * 100)}%${ends}`
         return (
           <Box key="charts" justifyContent="space-between" marginTop={1}>
             {tile('reads', 'Cache reads', readsCaption(stats), reads.chart, reads.cards)}
             {tile('pauses', 'Your pauses', caption('pace')?.value ?? ` vs the ${info.ttlMin === 60 ? '1h' : '5m'} TTL`, pauses.chart, pauses.cards)}
-            {tile('size', 'Cached', ` ${kTokens(info.tokens ?? stats.requests[stats.requests.length - 1]?.total ?? 0)} now`, size.chart, size.cards)}
+            {tile('context', 'Context', ctxCaption, context.chart, context.cards)}
           </Box>
         )
       })()
+      // Hovering a switch says what it does in place of the line's rest.
+      // Compact now runs `/compact` as if typed, orange while the verdict is.
+      // Pressed, it drops the orange at once: the compaction takes a while to
+      // show, and the PostCompact hook's last look for it is 12s after. Till
+      // then a press is ignored: each would queue another `/compact`, which
+      // summarizes the summary.
+      const isCompacting = flags.compactingSince !== null
+      const controls = [
+        {
+          key: 'compact-now',
+          label: isCompacting ? 'Compacting…' : 'Compact now',
+          isUrgent: advised?.color === 'warning' && !isCompactAsked,
+          tip: isCompacting || isCompactAsked
+            ? 'Compact now: /compact is already on its way; pressing again does nothing until it lands'
+            : `Compact now: ${advised?.color === 'warning' ? `${advised.why} · ` : ''}runs /compact, as typing it does${e.props.isWorking ? ', once this turn ends' : ''}`,
+          onPress: async () => {
+            if (flags.compactingSince !== null || (await read($, compactAsked)) !== null) return
+            const at = await $.clock.now()
+            await update($, compactAsked, () => at)
+            const settle = () => update($, compactAsked, prev => (prev === at ? null : prev))
+            await $.command.run({ command: 'compact' }).then(() => $.clock.after(15_000, settle), settle).catch(() => undefined)
+          },
+        },
+        // Off, on, auto, and round again.
+        {
+          key: 'keep-warm',
+          label: !isOn ? 'Keep-warm: off' : kw.isAuto ? 'Keep-warm: auto' : 'Keep-warm: on',
+          tip: !isOn
+            ? 'Keep-warm: off, the cache goes cold when you pause · click for on'
+            : kw.isAuto
+              ? "Keep-warm: auto, refreshes only when your pauses say you'll be back in time · click for off"
+              : `Keep-warm: on, refreshes the cache before it expires, up to ${limit} times · click for auto`,
+          onPress: () => setKeepWarm($, !isOn || !kw.isAuto, isOn && !kw.isAuto),
+        },
+        {
+          key: 'compact-toggle',
+          label: isCompactOn ? 'Compact: on' : 'Compact: off',
+          tip: isCompactOn ? 'Compact: on, compacts this chat before its cache goes cold · click for off' : "Compact: off, the mod won't compact this chat · click for on",
+          onPress: () => update($, keepWarm, prev => ({ ...prev, isCompactOn: !isCompactOn })),
+        },
+        {
+          key: 'stats-toggle',
+          label: isStatsOn ? 'Stats: on' : 'Stats: off',
+          tip: isStatsOn ? 'Stats: on · click to hide them' : "Stats: off · click for this chat's charts",
+          onPress: () => update($, showStats, () => !isStatsOn),
+        },
+        {
+          key: 'sound-toggle',
+          label: hasSound ? 'Sound: on' : 'Sound: off',
+          tip: hasSound ? "Sound: on · click to mute the mod's sounds, in every chat" : "Sound: off · click to hear the mod's sounds again",
+          onPress: () => setSound($, flags, !hasSound),
+        },
+      ]
+      const tips = controls.map(c => (
+        <Box key={`tip-${c.key}`} display="none" hover={{ scope: `tip-${c.key}`, display: 'flex' }}>
+          <Text dimColor wrap="truncate-end">{` · ${c.tip}`}</Text>
+        </Box>
+      ))
       rows.push(
         // Full width, as is the band's own box: the mint overlay below spans
         // this box, which the desktop otherwise sizes to the line's text.
@@ -2130,36 +2556,32 @@ export const register: Register = (on, options) => {
           {isRewarding && Svg !== null && prize !== null ? (
             rewardLine({ Box, Text, Svg }, prize, now)
           ) : (
-            mainLine({ Box, Text }, e.props.isWorking, info, now, current)
+            mainLine({ Box, Text }, e.props.isWorking, info, now, current, await read($, slept), flags.compactingSince, tips)
           )}
           <Box flexShrink={0}>
             <Text dimColor>{used}</Text>
           </Box>
-          <Box flexShrink={0} marginLeft={2}>
-            {/* Off, on, auto, and round again. */}
-            <Button
-              key="keep-warm"
-              label={!isOn ? 'Keep-warm: off' : kw.isAuto ? 'Keep-warm: auto' : 'Keep-warm: on'}
-              onPress={() => setKeepWarm($, !isOn || !kw.isAuto, isOn && !kw.isAuto)}
-            />
-          </Box>
-          <Box flexShrink={0} marginLeft={1}>
-            <Button
-              key="compact-toggle"
-              label={isCompactOn ? 'Compact: on' : 'Compact: off'}
-              onPress={() => update($, keepWarm, prev => ({ ...prev, isCompactOn: !isCompactOn }))}
-            />
-          </Box>
-          <Box flexShrink={0} marginLeft={1}>
-            <Button
-              key="stats-toggle"
-              label={isStatsOn ? 'Stats: on' : 'Stats: off'}
-              onPress={() => update($, showStats, () => !isStatsOn)}
-            />
-          </Box>
-          <Box flexShrink={0} marginLeft={1}>
-            <Button key="sound-toggle" label={hasSound ? 'Sound: on' : 'Sound: off'} onPress={() => setSound($, flags, !hasSound)} />
-          </Box>
+          {controls.map((c, i) => {
+            // A Button takes no color: urgent, a desktop's is drawn bare on an
+            // orange pill, a terminal's as its primary, in the accent color.
+            const isPill = c.isUrgent === true && e.surface !== 'terminal'
+            return (
+              <Box
+                key={`ctl-${c.key}`}
+                flexShrink={0}
+                marginLeft={i === 0 ? 2 : 1}
+                {...(isPill ? { borderStyle: 'round', borderColor: 'warning', backgroundColor: '#e59c0833', padding: 0 } : {})}
+              >
+                <Button
+                  key={c.key}
+                  label={c.label}
+                  {...(i > 0 || isPill ? { plain: true as const } : c.isUrgent ? { variant: 'primary' as const } : {})}
+                  hover={{ scope: `tip-${c.key}` }}
+                  onPress={c.onPress}
+                />
+              </Box>
+            )
+          })}
           {/* The extra gives way first, and clipped: squeezed to nothing, a text wraps a letter a row. */}
           {isSwapped ? (
             <Box flexShrink={1000} height={1} overflow="hidden" alignItems="flex-start">
@@ -2183,20 +2605,33 @@ export const register: Register = (on, options) => {
       )
       // The stats sit in a box of their own under this chat's line. Hovering
       // the chat count swaps the list in: both share one clipped row, the
-      // list first, so the band never changes height.
-      if (statText !== null || tiles !== null || runRows !== null) {
+      // list first, so the band never changes height. The verdict's and the
+      // week's details swap in the same way.
+      if (statText !== null || top !== null || adviceRows.length > 0 || tiles !== null || runRows !== null) {
         rows.push(
           <Box key="detail" flexDirection="column" borderStyle="round" borderDimColor paddingX={1} marginTop={1}>
-            {statText !== null || isSwapped ? (
-              <Box flexDirection="column" height={1} overflow="hidden" flexGrow={1}>
+            {statText !== null || top !== null || isSwapped ? (
+              <Box flexDirection="column" height={headRows} overflow="hidden" flexGrow={1}>
                 {isSwapped ? (
-                  <Box display="none" hover={{ scope: 'others', display: 'flex' }}>
+                  <Box display="none" height={headRows} hover={{ scope: 'others', display: 'flex' }}>
                     {chatList}
                   </Box>
                 ) : null}
+                {shownDecide !== null && shownDecide.card.length > 0 ? (
+                  <Box display="none" height={headRows} hover={{ scope: 'decide', display: 'flex' }}>
+                    {itemsText('decide-card', shownDecide.card, 'decide', true)}
+                  </Box>
+                ) : null}
+                {kwRow?.card ? (
+                  <Box display="none" height={headRows} hover={{ scope: 'kw-week', display: 'flex' }}>
+                    {itemsText('kw-card', kwRow.card, 'kw-week', true)}
+                  </Box>
+                ) : null}
                 {statText}
+                {top}
               </Box>
             ) : null}
+            {adviceRows}
             {tiles}
             {runRows}
           </Box>,

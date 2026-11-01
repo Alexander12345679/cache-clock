@@ -22,6 +22,12 @@ type Usage = { input_tokens: number; output_tokens: number; cache_read_input_tok
 
 const usage = (read: number, write: number): Usage => ({ input_tokens: 10, output_tokens: 5, cache_read_input_tokens: read, cache_creation_input_tokens: write })
 
+// A category of the context window's breakdown.
+const part = (name: string, tokens: number, kind: string) => ({ name, tokens, kind, color: 'promptBorder', isDeferred: false })
+
+// The color the Compact now button is drawn in, when it has one: its pill's.
+const compactColor = async (ui: any) => (await ui.find({ key: 'ctl-compact-now' }))?.props.borderColor
+
 // What the engine would answer beneath the plugin; `world` is what a test
 // sets up and reads back.
 function engine(on: On) {
@@ -32,6 +38,8 @@ function engine(on: On) {
     compactions: 0,
     isHeadless: false,
     compactCommands: 0,
+    // Holds a compaction, and `/compact`, open until what it returns settles.
+    holdCompaction: null as null | (() => Promise<void>),
     toasts: [] as string[],
     sounds: [] as string[],
     store: new Map<string, unknown>(),
@@ -40,7 +48,10 @@ function engine(on: On) {
     spend: '',
     tail: '',
     log: '',
+    // Lines the mod appended to its log.
+    logged: [] as string[],
     rateLimits: [] as { kind: string; percentUsed: number; resetsAt?: string }[],
+    context: {} as any,
     stopReason: 'end_turn' as string | null,
     agents: [] as { id: string; description: string; type: string; status: string }[],
     tools: [] as { name: string; description: string; mcp: boolean }[],
@@ -52,8 +63,9 @@ function engine(on: On) {
     return <Box />
   })
   on('classic.PostCompact', () => ({}))
-  on('session.compact', () => {
+  on('session.compact', async () => {
     if (world.isHeadless) throw new Error('not available in a headless (-p / SDK) session yet')
+    await world.holdCompaction?.()
     world.compactions += 1
     return { messages: [{ role: 'user' as const, text: 'summary', toolUses: [] }] }
   })
@@ -73,9 +85,10 @@ function engine(on: On) {
   on('session.start', (_$, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 'self' }))
   on('session.cwd', () => ({ value: '/work/innomed-erp' }))
-  on('session.usage', () => ({ value: { startedAt: 0, context: {} as any, rateLimits: world.rateLimits } }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: world.context, rateLimits: world.rateLimits } }))
   on('process.run', (_$, e) => {
     if (e.argv.join(' ').includes('cache-clock.log')) {
+      if (e.argv[2]?.includes('>>')) world.logged.push(e.argv[4] ?? '')
       return { value: { exitCode: 0, stdout: world.log, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     if (e.argv.join(' ').includes('--argjson since')) {
@@ -91,8 +104,9 @@ function engine(on: On) {
     return { value: { exitCode: found ? 0 : 1, stdout: found ? `${world.transcript}\n` : '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('command.register', (_$, e) => ({ value: { command: e.name } }))
-  on('command.run', { command: 'compact' }, () => {
+  on('command.run', { command: 'compact' }, async () => {
     world.compactCommands += 1
+    await world.holdCompaction?.()
     return { text: 'Compacted' }
   })
   on('model.fork', () => {
@@ -347,6 +361,7 @@ test('keep-warm refreshes before expiry, up to its limit, then compacts', { opti
   const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
   expect(await band.find({ text: /refreshed 1\/2/ })).toBeDefined()
   expect(await band.find({ text: /5\d:\d\d left/ })).toBeDefined()
+  await band.unmount()
 
   await clock.advance(60 * 60_000)
   expect(world.forks).toBe(2)
@@ -354,6 +369,7 @@ test('keep-warm refreshes before expiry, up to its limit, then compacts', { opti
 
   const spent = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
   expect(await spent.find({ text: /refreshed 2\/2, compacts before it goes cold/ })).toBeDefined()
+  await spent.unmount()
 
   // The limit is reached: the next approach to expiry compacts instead of
   // alerting, once, while the cache is still warm.
@@ -374,6 +390,58 @@ test('keep-warm refreshes before expiry, up to its limit, then compacts', { opti
   await send($)
   const after = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
   expect(await after.find({ text: /refreshed/ })).toBeUndefined()
+})
+
+test('a cache that expires while the computer sleeps says so, in the band and the log', { options: { keepWarm: true, autoCompact: true }, timeoutMs: 15_000 }, async ($, on) => {
+  // Asleep, the computer's timers stop while its clock runs on: the
+  // 10-second tick waits the sleep out, then comes due once, at the wake.
+  let isAsleep = false
+  on('clock.every', { ms: 10_000 }, async (_$, e, next) => {
+    let due = await next(e)
+    while (isAsleep) due = await next(e)
+    return due
+  })
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const world = engine(on)
+  const sleep = async (ms: number) => {
+    isAsleep = true
+    await clock.advance(ms)
+    isAsleep = false
+    await clock.advance(10_000)
+  }
+  const hm = (at: number) => `(\\w+ \\d+ )?${new Date(at).getHours()}:${String(new Date(at).getMinutes()).padStart(2, '0')}`
+  await start($)
+  await send($)
+
+  // A nap the cache outlasts: nothing to say.
+  await clock.advance(10 * 60_000)
+  await sleep(5 * 60_000)
+  const napped = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await napped.find({ text: /Cache warm/ })).toBeDefined()
+  expect(await napped.find({ text: /slept/ })).toBeUndefined()
+
+  // Asleep past the refresh, with a brief wake in between: one sleep, from
+  // the last tick before it to the first after.
+  await clock.advance(10 * 60_000)
+  const from = clock.now()
+  await sleep(60 * 60_000)
+  await clock.advance(10_000)
+  await sleep(20 * 60_000)
+  const to = clock.now()
+  expect(world.forks).toBe(0)
+  expect(world.compactions).toBe(0)
+  const woke = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await woke.find({ text: new RegExp(`expired 45:40 ago while the computer slept \\(${hm(from)}–${hm(to)}\\); next message`) })).toBeDefined()
+
+  // Awake a while, the log says it, once.
+  expect(world.logged).toEqual([])
+  await clock.advance(3 * 60_000)
+  await clock.advance(3 * 60_000)
+  expect(world.logged).toEqual([expect.stringMatching(new RegExp(`cache expired at ${hm(1_000_000 + 3_600_000)} while the computer slept \\(${hm(from)}–${hm(to)}\\)$`))])
+
+  await send($)
+  const after = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await after.find({ text: /slept/ })).toBeUndefined()
 })
 
 test('with keep-warm off, compacting on compacts a big chat before it goes cold, a small one not', { options: { keepWarm: false, autoCompact: true }, timeoutMs: 15_000 }, async ($, on) => {
@@ -477,11 +545,16 @@ test('the keep-warm button goes off, on, auto; auto refreshes only while this ch
   await $.classic.Stop({ transcript_path: '/p/self.jsonl' } as any)
 
   const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
-  expect(await band.find({ text: 'Keep-warm: off' })).toBeDefined()
+  // One glyph a state; hovering it names the state.
+  const glyph = async () => (await band.find({ key: 'keep-warm' }))?.props.label
+  expect(await glyph()).toBe('Keep-warm: off')
+  expect(await band.find({ text: /^ · Keep-warm: off, / })).toBeDefined()
   await band.press({ key: 'keep-warm' })
-  expect(await (await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })).find({ text: 'Keep-warm: on' })).toBeDefined()
-  await (await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })).press({ key: 'keep-warm' })
-  expect(await (await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })).find({ text: 'Keep-warm: auto' })).toBeDefined()
+  expect(await glyph()).toBe('Keep-warm: on')
+  await band.press({ key: 'keep-warm' })
+  expect(await glyph()).toBe('Keep-warm: auto')
+  // A mounted band is drawn again at every second of the hours below.
+  await band.unmount()
 
   // Every past pause past an hour ended within the next: one refresh.
   await clock.advance(59 * 60_000)
@@ -663,8 +736,11 @@ test("the other chats' hover opens with the week across chats: what warm returns
   for (const surface of ['desktop', 'terminal'] as const) {
     const band = await $.ui.mount({ plugin: 'cache-clock', surface, ...BAND(false) })
     expect(
-      await band.find({ text: 'This week, all chats: saved $2.50 · spent $10.00 · keep-warm ≈$1.00 for 10 refreshes, saved ≈$3.00 on 2 returns: paid back 3.0× · 1 pause went cold anyway   ' }),
+      await band.find({ text: 'This week, all chats: saved $2.50 · spent $10.00   ' }),
     ).toBeDefined()
+    // Keep-warm's week counts every chat's ledger, this one's and ERP's.
+    expect(await band.find({ text: /Keep-warm, all chats/ })).toBeDefined()
+    expect(await band.find({ text: ' this week ≈$1.00 for 10 refreshes, saved ≈$3.00 on 2 returns: paid back 3.0× · 1 pause went cold anyway' })).toBeDefined()
     expect(await band.find({ text: /^ERP$/ })).toBeDefined()
   }
 
@@ -723,15 +799,16 @@ test("two accounts sharing the store (Graft) keep their own chats and week; a ch
   for (const surface of ['desktop', 'terminal'] as const) {
     const band = await $.ui.mount({ plugin: 'cache-clock', surface, ...BAND(false) })
     expect(
-      await band.find({ text: 'This week, all chats: saved $1.00 · spent $3.30 · keep-warm ≈$1.00 for 10 refreshes, saved ≈$3.00 on 2 returns: paid back 3.0× · 1 pause went cold anyway   ' }),
+      await band.find({ text: 'This week, all chats: saved $1.00 · spent $3.30   ' }),
     ).toBeDefined()
+    expect(await band.find({ text: ' this week ≈$1.00 for 10 refreshes, saved ≈$3.00 on 2 returns: paid back 3.0× · 1 pause went cold anyway' })).toBeDefined()
     expect(await band.find({ text: /^Kiosk$/ })).toBeDefined()
     expect(await band.find({ text: /^ERP$/ })).toBeUndefined()
     expect(await band.find({ text: /Legacy/ })).toBeUndefined()
   }
 })
 
-test('/keep-warm now refreshes at once while warm, and refuses when cold', { options: { keepWarm: false } }, async ($, on) => {
+test('/keep-warm now refreshes at once while warm, and refuses when cold', { options: { keepWarm: false }, timeoutMs: 15_000 }, async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const world = engine(on)
   await start($)
@@ -820,21 +897,120 @@ test('a pause past the TTL whose return still read the cache counts as kept warm
   await clock.advance(10_000)
 
   const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
-  expect(await band.find({ text: /2 over 1h \(1 kept warm\)/ })).toBeDefined()
+  expect(await band.find({ text: / · 1 cold · 1 kept$/ })).toBeDefined()
   // Each bar's hover card says when the pause began, how long, and how it ended.
   expect(await band.find({ text: /^\d+:\d\d · 2h away · keep-warm held the cache$/ })).toBeDefined()
   expect(await band.find({ text: /^\d+:\d\d · 2h away · cache went cold$/ })).toBeDefined()
   expect(await band.find({ text: /^\d+:\d\d · 4m away · cache still warm$/ })).toBeDefined()
-  // The request charts: at 60 columns a tick spans two requests' bars.
+  // At 60 columns a tick on the context chart spans two requests; the reads
+  // chart, with fewer and wider bars, still has one each.
   const narrow = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false), props: { ...BAND(false).props, bodyColumns: 60 } })
-  expect(await narrow.find({ text: /^\d+:\d\d · 2 requests · 50% read from cache$/ })).toBeDefined()
-  expect(await narrow.find({ text: /^\d+:\d\d · 2 requests · 50% read from cache · 1 cache rebuild$/ })).toBeDefined()
-  expect(await narrow.find({ text: /^\d+:\d\d · 51k → 52k prompt$/ })).toBeDefined()
+  expect(await narrow.find({ text: /^\d+:\d\d · 0% read from cache · cache rebuilt$/ })).toBeDefined()
+  expect(await narrow.find({ text: /^\d+:\d\d · 51k → 52k · \+1k$/ })).toBeDefined()
   // At 100, as the desktop counts its band, one each.
   const wide = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
   expect(await wide.find({ text: /^\d+:\d\d · 0% read from cache · cache rebuilt$/ })).toBeDefined()
   expect(await wide.find({ text: /^\d+:\d\d · 99% read from cache$/ })).toBeDefined()
-  expect(await wide.find({ text: /^\d+:\d\d · 52k prompt$/ })).toBeDefined()
+  expect(await wide.find({ text: /^\d+:\d\d · 52k · \+500$/ })).toBeDefined()
+})
+
+test('the context tile counts the window in tokens, and the stats say whether to compact now', async ($, on) => {
+  const clock = mock.clock(on, { now: 20_000_000 })
+  const world = engine(on)
+  world.transcript = '/p/self.jsonl'
+  // Four turns of one request each, every one 20k more than the last.
+  const sec = (ms: number) => Math.floor(ms / 1000)
+  world.stats = [100_000, 120_000, 140_000, 160_000]
+    .flatMap((size, i) => [[sec(1_000_000 + i * 60_000), 'U'], [sec(1_010_000 + i * 60_000), 10, size, 0]])
+    .map(r => r.join('\t'))
+    .join('\n')
+  // A 1M model with a 200k compaction window set: the band counts the latter.
+  world.context = {
+    tokens: 160_010,
+    window: 1_000_000,
+    percent: 16,
+    breakdown: {
+      categories: [part('System prompt', 10_000, 'used'), part('Messages', 150_000, 'used'), part('Free space', 7_000, 'free'), part('Autocompact buffer', 33_000, 'buffer')],
+      totalTokens: 160_000,
+      maxTokens: 200_000,
+      rawMaxTokens: 200_000,
+      autoCompactThreshold: 167_000,
+      isAutoCompactEnabled: true,
+    },
+  }
+  await start($)
+  world.stepUsage.push(usage(160_000, 0))
+  await send($)
+  await clock.advance(10_000)
+
+  const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await band.find({ text: 'Context' })).toBeDefined()
+  expect(await band.find({ text: ' 160k of 200k · 80% · auto in ~1 turn' })).toBeDefined()
+  // A turn from auto-compaction: compact at a break of your choosing, at
+  // what it costs, and when the mod would; on hover, what it costs warm and
+  // cold, and what it saves a turn.
+  // The verdict, and the button wearing its orange.
+  expect(await band.findAll({ type: 'Text', text: /^Compact now$/ })).toHaveLength(1)
+  expect(await compactColor(band)).toBe('warning')
+  expect(await band.find({ text: /^ auto-compaction in ~1 turn at ~20k a turn · compacting ≈\$0\.34 · pays back in ~12 turns · mod compacts by \d+:\d\d if away$/ })).toBeDefined()
+  expect(await band.find({ text: ' ≈$0.34 now, ≈$1.58 once cold' })).toBeDefined()
+  expect(await band.find({ text: ' ≈$0.03 now, <$0.01 after compacting' })).toBeDefined()
+  expect(await band.find({ text: 'On its own' })).toBeUndefined()
+  // Each request's card on hover; no bar of what fills the window.
+  expect(await band.find({ text: /^\d+:\d\d · 160k \(80%\) · \+20k$/ })).toBeDefined()
+  expect(await band.find({ text: 'Messages' })).toBeUndefined()
+
+  await band.press({ key: 'stats-toggle' })
+  const off = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  // With Stats off the verdict is gone; the button still turns orange.
+  expect(await off.findAll({ type: 'Text', text: /^Compact now$/ })).toHaveLength(0)
+  expect(await compactColor(off)).toBe('warning')
+  expect(await off.find({ text: 'Context' })).toBeUndefined()
+
+  // Pressed, it drops the orange at once; with no compaction landed after
+  // `/compact` returned, it wears it again.
+  await off.press({ key: 'compact-now' })
+  expect(world.compactCommands).toBe(1)
+  const pressed = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await compactColor(pressed)).toBeUndefined()
+  await clock.advance(15_000)
+  const again = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await compactColor(again)).toBe('warning')
+})
+
+test('a chat of long tasks and short questions counts its turns at their average, and the verdict says it', async ($, on) => {
+  const clock = mock.clock(on, { now: 20_000_000 })
+  const world = engine(on)
+  world.transcript = '/p/self.jsonl'
+  // Two long tasks (+70k, +110k), an auto-compaction, two short questions
+  // (+1k, +2k): the median would count every turn as a long task.
+  const sec = (ms: number) => Math.floor(ms / 1000)
+  world.stats = [80_000, 150_000, 260_000, 110_000, 111_000, 113_000]
+    .flatMap((size, i) => [[sec(1_000_000 + i * 60_000), 'U'], [sec(1_010_000 + i * 60_000), 10, size, 0]])
+    .map(r => r.join('\t'))
+    .join('\n')
+  world.context = {
+    tokens: 114_010,
+    window: 300_000,
+    percent: 38,
+    breakdown: {
+      categories: [part('System prompt', 54_000, 'used'), part('Messages', 60_000, 'used'), part('Free space', 156_000, 'free'), part('Autocompact buffer', 30_000, 'buffer')],
+      totalTokens: 114_000,
+      maxTokens: 300_000,
+      rawMaxTokens: 300_000,
+      autoCompactThreshold: 270_000,
+      isAutoCompactEnabled: true,
+    },
+  }
+  await start($)
+  world.stepUsage.push(usage(114_000, 0))
+  await send($)
+  await clock.advance(10_000)
+
+  // At ~46k a turn, auto-compaction at 270k is 4 turns off: not orange yet.
+  const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await band.find({ text: /^ room for ~4 turns at ~46k a turn · / })).toBeDefined()
+  expect(await compactColor(band)).toBeUndefined()
 })
 
 test('the band shows cache stats under this chat, and a wide band two subagents to a row', async ($, on) => {
@@ -864,17 +1040,18 @@ test('the band shows cache stats under this chat, and a wide band two subagents 
   await clock.advance(10_000)
 
   const lone = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...wide })
-  expect(await lone.find({ text: /≈40× reading it warm/ })).toBeDefined()
-  expect(await lone.find({ text: /re-caching 127k/ })).toBeDefined()
+  // What going cold costs is on the chat's line; no row repeats it.
+  expect(await lone.find({ text: /127k cached · ≈\$\d+\.\d\d if cold$/ })).toBeDefined()
+  expect(await lone.find({ text: /≈40×/ })).toBeUndefined()
   expect(await lone.find({ text: /^ \d+% · 1 rebuild$/ })).toBeDefined()
-  expect(await lone.find({ text: /typically 4m · 1 over 1h/ })).toBeDefined()
+  expect(await lone.find({ text: ' median 4m · 1 cold' })).toBeDefined()
   // No refresh this week: nothing spent on keep-warm.
-  expect(await lone.find({ text: ' no refreshes in 7 days, nothing spent' })).toBeDefined()
+  expect(await lone.find({ text: ' nothing spent in 7 days' })).toBeDefined()
 
   // The band's stats button switches them off for this chat, and back on.
   await lone.press({ key: 'stats-toggle' })
   const off = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...wide })
-  expect(await off.find({ text: /≈40×/ })).toBeUndefined()
+  expect(await off.find({ text: / median 4m/ })).toBeUndefined()
   expect(await off.find({ text: 'Stats: off' })).toBeDefined()
   await off.press({ key: 'stats-toggle' })
 
@@ -883,11 +1060,11 @@ test('the band shows cache stats under this chat, and a wide band two subagents 
   const busy = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...wide })
   for (const n of [1, 2, 3, 4, 5]) expect(await busy.find({ text: `Task ${n}` })).toBeDefined()
   expect(await busy.find({ text: /more subagents/ })).toBeUndefined()
-  expect(await busy.find({ text: /≈40×/ })).toBeDefined()
+  expect(await busy.find({ text: / median 4m/ })).toBeDefined()
 
   const narrow = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
   expect(await narrow.find({ text: /\+3 more subagents/ })).toBeDefined()
-  expect(await narrow.find({ text: /≈40×/ })).toBeDefined()
+  expect(await narrow.find({ text: / median 4m/ })).toBeDefined()
 })
 
 test("a new chat, whose transcript did not exist yet when it started, shows its stats once a turn names it", async ($, on) => {
@@ -1018,6 +1195,64 @@ test('a turn nobody typed (a wake-up) plays no reward', async ($, on) => {
   expect(world.sounds).toEqual(['sounds/mint.wav'])
 })
 
+test('Compact now runs /compact, as typing it does', async ($, on) => {
+  mock.clock(on, { now: 1_000_000 })
+  const world = engine(on)
+  world.stepUsage.push(usage(0, 100_000))
+  await start($)
+  await send($)
+  const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  expect(await compactColor(band)).toBeUndefined()
+  await band.press({ key: 'compact-now' })
+  expect(world.compactCommands).toBe(1)
+})
+
+test('while a compaction runs the band says so, and Compact now does not queue another', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const world = engine(on)
+  world.stepUsage.push(usage(0, 100_000))
+  await start($)
+  await send($)
+  let release = () => {}
+  const hold = () => {
+    let entered = () => {}
+    const isHeld = new Promise<void>(r => (entered = r))
+    world.holdCompaction = () => {
+      entered()
+      return new Promise<void>(r => (release = r))
+    }
+    return isHeld
+  }
+  const mount = () => $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+
+  // A compaction the engine runs (a `/compact`, the button's or typed) takes
+  // a while, and the chat shows it only once it lands.
+  let isHeld = hold()
+  const compacting = $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'hello', toolUses: [] }] })
+  await isHeld
+  await clock.advance(12_000)
+  const running = await mount()
+  expect(await running.find({ text: '◐ Compacting' })).toBeDefined()
+  expect(await running.find({ text: ' · writing the summary, 0:12 so far; the chat shows it when done' })).toBeDefined()
+  expect((await running.find({ key: 'compact-now' }))?.props.label).toBe('Compacting…')
+  await running.press({ key: 'compact-now' })
+  expect(world.compactCommands).toBe(0)
+  release()
+  await compacting
+  const done = await mount()
+  expect(await done.find({ text: '◐ Compacting' })).toBeUndefined()
+  expect((await done.find({ key: 'compact-now' }))?.props.label).toBe('Compact now')
+
+  // Pressed, until its `/compact` returns, a second press queues nothing.
+  isHeld = hold()
+  const pressed = done.press({ key: 'compact-now' })
+  await isHeld
+  await (await mount()).press({ key: 'compact-now' })
+  release()
+  await pressed
+  expect(world.compactCommands).toBe(1)
+})
+
 test('the Sound button mutes every sound of the mod, in every chat, until pressed again', async ($, on) => {
   const clock = mock.clock(on, { now: 1_000_000 })
   const world = engine(on)
@@ -1028,7 +1263,7 @@ test('the Sound button mutes every sound of the mod, in every chat, until presse
   await band.press({ key: 'sound-toggle' })
   expect(world.store.get('sound')).toBe(false)
   const muted = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
-  expect(await muted.find({ text: 'Sound: off' })).toBeDefined()
+  expect((await muted.find({ key: 'sound-toggle' }))?.props.label).toBe('Sound: off')
 
   // A reward, and then a new cache, play their scenes silently.
   world.sounds.length = 0
@@ -1134,7 +1369,7 @@ test('without keep-warm a running workflow is named in the expiry toast, not the
   await $.classic.Stop({ background_tasks: RUNNING } as any)
 
   const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
-  expect(await band.find({ text: /≈\$0\.80 if it goes cold/ })).toBeDefined()
+  expect(await band.find({ text: /≈\$0\.80 if cold/ })).toBeDefined()
   expect(await band.find({ text: / · workflow mint-animation running/ })).toBeUndefined()
   expect(await band.find({ text: /1 agent · 75% of 40k prompt tokens read from cache/ })).toBeDefined()
   // Its agents are not this chat's subagents.
@@ -1203,7 +1438,10 @@ test("a chat's keep-warm from before the ledger comes from the log, counting onl
   await send($)
   await clock.advance(6 * 60_000)
   const text = ' in 7 days ≈$0.12 for 3 refreshes, saved ≈$1.56 on 1 return: paid back 12.9× · 1 pause went cold anyway'
-  expect(await (await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })).find({ text })).toBeDefined()
+  const band = await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })
+  // Over the charts the week's net shows; that sentence is its hover.
+  expect(await band.find({ text })).toBeDefined()
+  expect(await band.find({ text: /^\+\$1\.4\d$/ })).toBeDefined()
   // Once: the next read of the stats adds nothing.
   await clock.advance(6 * 60_000)
   expect(await (await $.ui.mount({ plugin: 'cache-clock', surface: 'desktop', ...BAND(false) })).find({ text })).toBeDefined()

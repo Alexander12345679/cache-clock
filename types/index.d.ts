@@ -95,6 +95,14 @@ export type WorkflowRun = {
   isDone?: boolean
 }
 
+/** The computer asleep: this session's timers stopped from `from` to `to`, epoch ms. */
+export type Sleep = {
+  from: number
+  to: number
+  /** Awake long enough since that it is over, and the log was told. */
+  isLogged?: boolean
+}
+
 /** Another chat's cache as its own session last published it to the store. */
 export type OtherChat = {
   id: string
@@ -119,6 +127,10 @@ declare module 'claude-code' {
       showStats: boolean | null
       minted: Mint | null
       reward: Reward | null
+      /** When Compact now was pressed, epoch ms, until its compaction has had time to land: the button is not orange meanwhile. */
+      compactAsked: number | null
+      /** The computer's last sleep, as this session's timers saw it; null until one. */
+      slept: Sleep | null
       /** This chat's workflow runs by run id, the recent ones. */
       runs: Record<string, WorkflowRun>
     }

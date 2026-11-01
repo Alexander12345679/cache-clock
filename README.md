@@ -114,16 +114,18 @@ sudo rsync -a --no-owner --no-group --delete --exclude .git ~/cache-clock/ "/Lib
 
 | | |
 |---|---|
-| ⏳ **Countdown** | `● Cache warm · 41:20 left (1h TTL) · 248k cached (≈$0.80 if it goes cold)`. It turns yellow near the end, then reads `○ Cache cold · expired 3:10 ago`. The mod knows the cache's real TTL from the transcript, and knows that switching models, `/compact` or `/clear` starts a new cache. |
+| ⏳ **Countdown** | `● Cache warm · 41:20 left (1h TTL) · 248k cached · ≈$0.80 if cold`. It turns yellow near the end, then reads `○ Cache cold · expired 3:10 ago`. The mod knows the cache's real TTL from the transcript, and knows that switching models, `/compact` or `/clear` starts a new cache. |
 | 🔥 **Keep-warm** | Shortly before the cache expires, the mod refreshes it with one small request, for about a twentieth of what a rewrite costs. [More below.](#-keep-warm) |
-| 🗜️ **Compact** | Compacts the chat while its cache is still warm, so your next message writes only the summary instead of the whole history. [More below.](#%EF%B8%8F-compact) |
+| 🗜️ **Compact** | Compacts the chat while its cache is still warm, so your next message writes only the summary instead of the whole history. The band's **Compact now** button runs `/compact` whenever you want it, and turns orange when auto-compaction is a few turns away, even with Stats off. While a compaction runs, the chat's line says so (`◐ Compacting · writing the summary, 0:12 so far`), and pressing again does nothing until it lands. [More below.](#%EF%B8%8F-compact) |
 | 💡 **New cache** | An LED panel lights up across the band and breaks away, to a little tune of its own (mallets and bells, in step with the lights). |
 | ⚠️ **Misses** | When a message should have read the cache and didn't, the band says so. If it can see why, it names the cause: an MCP server that connected or left, a tool that was added, removed or reworded, a changed section of the system prompt, or a new effort level. |
-| 🗂️ **Other chats** | How many of your other chats have a cache. Hover the count to see how long each one has left, soonest first (with Stats off, the list shows under the band). With Stats on, the list opens with the week across all chats: what warm returns saved, what every chat spent at list price, and whether keep-warm paid for itself, counting the chats that ran this week with the mod. |
-| 📊 **Stats** | What going cold would cost compared with reading the cache warm, how much of this chat was read from cache, and how often the cache was rebuilt, with charts of both; hover the ticks under a chart for each request or pause. Also whether keep-warm paid for itself this week (your plan's weekly window, else the last 7 days): what its refreshes cost against the rewrites they saved, at list price. |
+| 🗂️ **Other chats** | How many of your other chats have a cache. Hover the count to see how long each one has left, soonest first (with Stats off, the list shows under the band). With Stats on, the list opens with the week across all chats: what warm returns saved, and what every chat spent at list price, counting the chats that ran this week with the mod. |
+| 📊 **Stats** | Charts of how much of this chat was read from cache (each rebuild in orange), your pauses against the TTL, and how full the context window is (`142k of 200k · 71% · auto in ~6 turns`, with a dashed line where auto-compaction starts); hover the ticks under a chart for each request or pause. Above the charts, two lines: `Compact now` or `Wait` says whether to compact by hand and why (`auto-compaction in ~3 turns at ~46k a turn`, at this chat's average turn), with what it costs, how many turns it takes to pay back, and when the mod would compact if you're away; hover it for the cost once cold and per turn. Beside it, whether keep-warm paid for itself this week across all your chats (your plan's weekly window, else the last 7 days; this chat only with Other chats off): the net, and a bar of what its held returns saved against what its refreshes cost, at list price; hover it for the details. In the terminal, the same stats are text rows. |
 | 🤖 **Subagents & workflows** | Their caches, and how much a running workflow has read from cache. |
 | 🔇 **Sound** | One button mutes every sound the mod makes, in every chat. |
 | 🎉 **Reward** | Each time you come back to a warm cache, Clawd celebrates what you saved. [See it below.](#-the-reward) |
+
+Hover one of the band's switches and the chat's line says what it does.
 
 ## 🔥 Keep-warm
 
@@ -132,6 +134,7 @@ sudo rsync -a --no-owner --no-group --delete --exclude .git ~/cache-clock/ "/Lib
 - **It stops on its own.** After a set number of refreshes (3 by default), the cache is allowed to go cold, with an expiry alert, unless compacting is on.
 - **It holds while work runs.** If a workflow or background agent of the chat is still running, keep-warm keeps refreshing for as long as that's cheaper than caching again.
 - **You switch it per chat.** Use the band button or `/keep-warm`. The button cycles **off → on → auto**.
+- **It can't run while the computer sleeps.** Close a laptop's lid and nothing refreshes or compacts until it wakes. If the cache expired meanwhile, the band says so (`○ Cache cold · expired 47:10 ago while the computer slept (10:30–11:59)`), and so does the log.
 
 <details>
 <summary><b>Auto mode</b>: refresh only when you're likely to come back in time</summary>
@@ -216,7 +219,7 @@ echo '{"reward":"animation"}' | claude plugin configure cache-clock@cache-clock 
 ## 🔒 What it keeps
 
 - **Stays on your machine.** Per-chat state lives in the session. Other chats' caches, each chat's weekly spend and the reward totals are in the mod's store, under `~/.claude/plugins/store/`.
-- **Logged.** Each keep-warm refresh and each compaction writes one line to `~/.claude/cache-clock.log`. Once the log passes 1000 lines, it's trimmed to the last 500.
+- **Logged.** Each keep-warm refresh and each compaction writes one line to `~/.claude/cache-clock.log`, and so does a cache that expired while the computer slept. Once the log passes 1000 lines, it's trimmed to the last 500.
 - **Nothing is sent anywhere.** The only requests the mod makes are keep-warm's own refreshes, on your account.
 
 <details>
